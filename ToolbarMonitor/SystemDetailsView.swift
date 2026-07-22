@@ -800,6 +800,7 @@ private struct QuotaLabelWidthKey: PreferenceKey {
 }
 
 private struct AgentUsageGroupView: View {
+    @State private var showModels = false
     let agent: AgentTokenUsage
     let color: Color
     let total: Int64
@@ -811,46 +812,125 @@ private struct AgentUsageGroupView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 7) {
-                AgentBrandLogo(agent: agent.agent, color: color, size: 15, showsBackground: true)
+            Button {
+                guard !agent.models.isEmpty else { return }
+                withAnimation(.easeOut(duration: 0.18)) {
+                    showModels.toggle()
+                }
+            } label: {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 7) {
+                        AgentBrandLogo(agent: agent.agent, color: color, size: 15, showsBackground: true)
 
-                Text(agent.displayName)
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(1)
+                        Text(agent.displayName)
+                            .font(.caption.weight(.semibold))
+                            .lineLimit(1)
 
-                Spacer(minLength: 8)
+                        Spacer(minLength: 8)
 
-                Text(agent.topModel ?? "未知模型")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                        if !agent.models.isEmpty {
+                            Text("\(agent.models.count) 个模型")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 8, weight: .medium))
+                                .foregroundStyle(.tertiary)
+                                .rotationEffect(.degrees(showModels ? 180 : 0))
+                        }
+                    }
+
+                    HStack(spacing: 5) {
+                        Text("用量")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 30, alignment: .leading)
+
+                        AccountQuotaBar(percent: sharePercent, style: .usage, tint: color)
+                            .animation(.easeOut(duration: 0.45), value: sharePercent)
+
+                        Text(agent.tokens.total.tokenText)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                            .frame(width: 48, alignment: .trailing)
+
+                        Text("\(Int(sharePercent.rounded()))%")
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                            .frame(width: 34, alignment: .trailing)
+                    }
+                }
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel(
+                "\(agent.displayName)，\(agent.tokens.total.tokenText) Token，占所选时段 \(Int(sharePercent.rounded()))%"
+            )
+            .accessibilityHint(agent.models.isEmpty ? "没有模型明细" : "展开或收起模型明细")
 
-            HStack(spacing: 5) {
-                Text("用量")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 30, alignment: .leading)
-
-                AccountQuotaBar(percent: sharePercent, style: .usage, tint: color)
-                    .animation(.easeOut(duration: 0.45), value: sharePercent)
-
-                Text(agent.tokens.total.tokenText)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-                    .frame(width: 48, alignment: .trailing)
-
-                Text("\(Int(sharePercent.rounded()))%")
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                    .frame(width: 34, alignment: .trailing)
+            if showModels, !agent.models.isEmpty {
+                ModelBreakdownList(models: agent.models, total: agent.tokens.total, color: color)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
+        .accessibilityElement(children: .contain)
+    }
+}
+
+private struct ModelBreakdownList: View {
+    let models: [ModelTokenUsage]
+    let total: Int64
+    let color: Color
+
+    var body: some View {
+        VStack(spacing: 5) {
+            ForEach(models) { model in
+                ModelUsageRow(model: model, total: total, color: color)
+            }
+        }
+        .padding(.top, 2)
+        .padding(.leading, 22)
+    }
+}
+
+private struct ModelUsageRow: View {
+    let model: ModelTokenUsage
+    let total: Int64
+    let color: Color
+
+    private var sharePercent: Double {
+        guard total > 0 else { return 0 }
+        return min(max(Double(model.tokens.total) / Double(total) * 100, 0), 100)
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Text(model.name)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(width: 112, alignment: .leading)
+
+            AccountQuotaBar(percent: sharePercent, style: .usage, tint: color.opacity(0.8))
+                .animation(.easeOut(duration: 0.45), value: sharePercent)
+
+            Text(model.tokens.total.tokenText)
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+                .frame(width: 48, alignment: .trailing)
+
+            Text("\(Int(sharePercent.rounded()))%")
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                .frame(width: 34, alignment: .trailing)
+        }
+        .help("\(model.name)：\(model.tokens.total.tokenText) Token，占该 Agent \(Int(sharePercent.rounded()))%")
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(
-            "\(agent.displayName)，\(agent.tokens.total.tokenText) Token，占所选时段 \(Int(sharePercent.rounded()))%"
+            "\(model.name)，\(model.tokens.total.tokenText) Token，占该 Agent \(Int(sharePercent.rounded()))%"
         )
     }
 }
