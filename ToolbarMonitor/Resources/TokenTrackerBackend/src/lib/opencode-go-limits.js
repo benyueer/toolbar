@@ -53,17 +53,58 @@ const USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Gecko/20100101 Firefox/148.0";
 const DEFAULT_SCRAPE_TIMEOUT_MS = 10_000;
 
-function readConfig(env = process.env) {
+function readConfig(env = process.env, home = null) {
   if (!env || typeof env !== "object") return null;
-  const workspaceId =
+  let workspaceId =
     typeof env.OPENCODE_GO_WORKSPACE_ID === "string"
       ? env.OPENCODE_GO_WORKSPACE_ID.trim()
       : "";
-  const authCookie =
+  let authCookie =
     typeof env.OPENCODE_GO_AUTH_COOKIE === "string"
       ? env.OPENCODE_GO_AUTH_COOKIE.trim()
       : "";
+
+  if (!authCookie && home) {
+    try {
+      const configPaths = [
+        path.join(home, ".tokentracker", "tracker", "config.json"),
+        path.join(home, ".tokentracker", "config.json"),
+      ];
+      for (const cfgPath of configPaths) {
+        if (fssync.existsSync(cfgPath)) {
+          const content = fssync.readFileSync(cfgPath, "utf8");
+          const json = JSON.parse(content);
+          if (json && typeof json === "object") {
+            if (!authCookie) {
+              const val =
+                json.opencode_go_auth_cookie ||
+                json.opencodeGoAuthCookie ||
+                json.OPENCODE_GO_AUTH_COOKIE;
+              if (typeof val === "string") authCookie = val.trim();
+            }
+            if (!workspaceId) {
+              const val =
+                json.opencode_go_workspace_id ||
+                json.opencodeGoWorkspaceId ||
+                json.OPENCODE_GO_WORKSPACE_ID;
+              if (typeof val === "string") workspaceId = val.trim();
+            }
+          }
+        }
+      }
+    } catch (_e) {
+      /* ignore file read error */
+    }
+  }
+
   if (!authCookie) return null;
+
+  // Extract pure 'auth' value if full Cookie header string or 'auth=...' prefix was provided
+  const authMatch = authCookie.match(/(?:^|;\s*)auth=([^;]+)/);
+  if (authMatch) {
+    authCookie = authMatch[1].trim();
+  }
+
   return { workspaceId, authCookie };
 }
 
@@ -257,7 +298,7 @@ async function resolveWorkspaceId(authCookie, fetchImpl, timeoutMs) {
 
 function parseWorkspaceIds(text) {
   const ids = new Set();
-  const re = /id\s*[:=]+\s*\\?"(wrk_[^\\"]+)\\"?/g;
+  const re = /(?:id|"id"|'id')\s*[:=]+\s*\\?["']?(wrk_[a-zA-Z0-9_-]+)\\?["']?/g;
   let m;
   while ((m = re.exec(text)) !== null) {
     ids.add(m[1]);
@@ -553,7 +594,7 @@ async function fetchOpencodeGoLimits({
   timeoutMs = DEFAULT_SCRAPE_TIMEOUT_MS,
   sqliteOptions = {},
 } = {}) {
-  const cfg = readConfig(env);
+  const cfg = readConfig(env, home);
 
   // Cookie configured → prefer the exact server-side scrape; fall back to the
   // local DB estimate when the scrape can't authenticate/parse (the #225 case).

@@ -73,6 +73,7 @@ struct DailyTokenUsage: Identifiable, Equatable, Sendable {
     let dateKey: String
     let tokens: TokenBreakdown
     let agents: [AgentTokenUsage]
+    let estimatedCost: Double?
 
     var id: String { dateKey }
 }
@@ -160,6 +161,12 @@ struct TokenUsageSnapshot: Equatable, Sendable {
     static let empty = TokenUsageSnapshot()
 
     var today: TokenBreakdown { totals(last: 1) }
+    var todayEstimatedCost: Double? {
+        if let cost = selectedDays(last: 1).first?.estimatedCost, cost > 0 {
+            return cost
+        }
+        return days.reversed().first(where: { ($0.estimatedCost ?? 0) > 0 })?.estimatedCost
+    }
     var last7Days: TokenBreakdown { totals(last: 7) }
     var last30Days: TokenBreakdown { totals(last: 30) }
 
@@ -241,17 +248,21 @@ final class TokenUsageMonitor: ObservableObject {
         errorMessage = nil
 
         Task { [weak self] in
-            let result = await Task.detached(priority: .utility) {
-                Result {
-                    try TokenUsageCollector.collect(
+            let result: Result<TokenUsageSnapshot, Error>
+            do {
+                let nextSnapshot = try await Task.detached(priority: .userInitiated) {
+                    try await TokenUsageCollector.collect(
                         syncAntigravity: shouldSync,
                         refreshQuotas: shouldRefreshQuotas,
                         forceQuotaProviderRefresh: forceQuotaRefresh,
                         cachedQuotas: cachedQuotas,
                         cachedQuotaSource: cachedQuotaSource
                     )
-                }
-            }.value
+                }.value
+                result = .success(nextSnapshot)
+            } catch {
+                result = .failure(error)
+            }
 
             guard let self else { return }
             isRefreshing = false
@@ -281,12 +292,18 @@ enum TokenUsageCollector {
         let date: String
         let tokenBreakdown: GraphTokens
         let clients: [GraphClient]
+        let totals: GraphTotals?
     }
 
     private struct GraphClient: Decodable {
         let client: String
         let modelId: String
         let tokens: GraphTokens
+        let cost: Double?
+    }
+
+    private struct GraphTotals: Decodable {
+        let cost: Double?
     }
 
     private struct GraphTokens: Decodable {
@@ -311,17 +328,65 @@ enum TokenUsageCollector {
         var tokens = TokenBreakdown()
         var agents: [String: TokenBreakdown] = [:]
         var models: [String: [String: TokenBreakdown]] = [:]
+        var estimatedCost: Double?
     }
 
     private enum CollectorError: LocalizedError {
         case invalidTokscaleOutput
         case processFailed(String)
+        case processTimeout(String)
 
         var errorDescription: String? {
             switch self {
             case .invalidTokscaleOutput: "无法解析 tokscale 的统计结果"
             case .processFailed(let command): "Token 统计命令执行失败：\(command)"
+            case .processTimeout(let command): "Token 统计命令执行超时：\(command)"
             }
+        }
+    }
+
+    /// 线程安全的可执行文件路径定位与缓存器（带有 TTL 保护，避免频繁启动 Shell）
+    private final class ExecutableLocator: @unchecked Sendable {
+        static let shared = ExecutableLocator()
+        private let lock = NSLock()
+        private var cache: [String: (url: URL?, timestamp: Date)] = [:]
+        private let ttl: TimeInterval = 300 // 缓存 5 分钟
+
+        func locate(_ name: String, candidates: [String], shellCommand: String) -> URL? {
+            lock.lock()
+            if let cached = cache[name], Date().timeIntervalSince(cached.timestamp) < ttl {
+                let url = cached.url
+                lock.unlock()
+                return url
+            }
+            lock.unlock()
+
+            var foundURL: URL?
+            for candidate in candidates {
+                if FileManager.default.isExecutableFile(atPath: candidate) {
+                    foundURL = URL(fileURLWithPath: candidate)
+                    break
+                }
+            }
+
+            if foundURL == nil {
+                if let output = try? TokenUsageCollector.run(
+                    URL(fileURLWithPath: "/bin/zsh"),
+                    arguments: ["-lic", shellCommand],
+                    timeout: 3
+                ), let path = String(data: output, encoding: .utf8)?
+                    .split(whereSeparator: \.isNewline)
+                    .first
+                    .map(String.init),
+                    FileManager.default.isExecutableFile(atPath: path) {
+                    foundURL = URL(fileURLWithPath: path)
+                }
+            }
+
+            lock.lock()
+            cache[name] = (foundURL, Date())
+            lock.unlock()
+            return foundURL
         }
     }
 
@@ -331,54 +396,122 @@ enum TokenUsageCollector {
         forceQuotaProviderRefresh: Bool = false,
         cachedQuotas: [ProviderQuotaUsage] = [],
         cachedQuotaSource: TokenUsageSnapshot.QuotaSource? = nil
-    ) throws -> TokenUsageSnapshot {
-        var snapshot: TokenUsageSnapshot
-
-        if let executable = locateTokscale() {
-            do {
-                var antigravitySynced = false
-                if syncAntigravity {
-                    if let syncOutput = try? run(executable, arguments: ["antigravity", "sync"]) {
+    ) async throws -> TokenUsageSnapshot {
+        // 并行任务 1：从 tokscale / 本地日志拉取 Token 使用量与同步记录
+        async let snapshotTask = Task.detached(priority: .userInitiated) { () -> TokenUsageSnapshot in
+            var snapshot: TokenUsageSnapshot
+            if let executable = locateTokscale() {
+                do {
+                    var antigravitySynced = false
+                    if syncAntigravity, let syncOutput = try? run(executable, arguments: ["antigravity", "sync"], timeout: 15) {
                         antigravitySynced = detectedAntigravityConnection(in: syncOutput)
                     }
+
+                    let start = dayKey(for: Calendar.current.date(byAdding: .day, value: -29, to: Date()) ?? Date())
+                    let data = try run(
+                        executable,
+                        arguments: ["graph", "--since", start, "--no-spinner"],
+                        timeout: 15
+                    )
+                    snapshot = try parseTokscaleGraph(data)
+                    snapshot.source = .tokscale
+                    snapshot.antigravitySynced = antigravitySynced
+
+                    let localSnapshot = collectLocalLogs()
+                    mergeAntigravityDataIfNeeded(into: &snapshot, from: localSnapshot)
+                } catch {
+                    snapshot = collectLocalLogs()
+                    snapshot.note = "tokscale 暂时不可用，已改用本地日志统计"
                 }
-
-                let start = dayKey(for: Calendar.current.date(byAdding: .day, value: -29, to: Date()) ?? Date())
-                let data = try run(
-                    executable,
-                    arguments: ["graph", "--since", start, "--no-spinner"]
-                )
-                snapshot = try parseTokscaleGraph(data)
-                snapshot.source = .tokscale
-                snapshot.antigravitySynced = antigravitySynced
-            } catch {
+            } else {
                 snapshot = collectLocalLogs()
-                snapshot.note = "tokscale 暂时不可用，已改用本地日志统计"
             }
-        } else {
-            snapshot = collectLocalLogs()
-        }
+            return snapshot
+        }.value
 
-        if refreshQuotas {
+        // 并行任务 2：从 TokenTracker 后端异步拉取实时额度
+        async let quotasTask = Task.detached(priority: .userInitiated) { () -> ([ProviderQuotaUsage]?, TokenUsageSnapshot.QuotaSource?) in
+            guard refreshQuotas else {
+                return (cachedQuotas, cachedQuotaSource)
+            }
             if let limitsData = try? fetchEmbeddedTokenTrackerLimits(forceRefresh: forceQuotaProviderRefresh),
                let quotas = try? parseEmbeddedTokenTrackerLimits(limitsData),
                !quotas.isEmpty {
-                snapshot.quotaProviders = quotas
-                snapshot.quotaSource = .embeddedTokenTracker
+                return (quotas, .embeddedTokenTracker)
             } else {
-                snapshot.quotaProviders = cachedQuotas
-                snapshot.quotaSource = cachedQuotaSource
-                let quotaNote = cachedQuotas.isEmpty
-                    ? "内置 TokenTracker 额度采集器暂时不可用"
-                    : "内置 TokenTracker 额度暂时无法刷新，继续显示上次结果"
-                snapshot.note = [snapshot.note, quotaNote].compactMap { $0 }.joined(separator: "；")
+                return (nil, nil)
             }
+        }.value
+
+        var finalSnapshot = await snapshotTask
+        let (fetchedQuotas, fetchedSource) = await quotasTask
+
+        if let fetchedQuotas, !fetchedQuotas.isEmpty, let fetchedSource {
+            finalSnapshot.quotaProviders = fetchedQuotas
+            finalSnapshot.quotaSource = fetchedSource
+        } else if refreshQuotas {
+            finalSnapshot.quotaProviders = cachedQuotas
+            finalSnapshot.quotaSource = cachedQuotaSource
+            let quotaNote = cachedQuotas.isEmpty
+                ? "内置 TokenTracker 额度采集器暂时不可用"
+                : "内置 TokenTracker 额度暂时无法刷新，继续显示上次结果"
+            finalSnapshot.note = [finalSnapshot.note, quotaNote].compactMap { $0 }.joined(separator: "；")
         } else {
-            snapshot.quotaProviders = cachedQuotas
-            snapshot.quotaSource = cachedQuotaSource
+            finalSnapshot.quotaProviders = cachedQuotas
+            finalSnapshot.quotaSource = cachedQuotaSource
         }
 
-        return snapshot
+        return finalSnapshot
+    }
+
+    /// 确保在 tokscale graph 与本地 Antigravity 缓存之间取并集，防止任何新导出的 Antigravity Token 遗漏
+    private static func mergeAntigravityDataIfNeeded(
+        into snapshot: inout TokenUsageSnapshot,
+        from localSnapshot: TokenUsageSnapshot
+    ) {
+        var daysMap = Dictionary(uniqueKeysWithValues: snapshot.days.map { ($0.dateKey, $0) })
+
+        for localDay in localSnapshot.days {
+            guard let localAntigravity = localDay.agents.first(where: { $0.agent == "antigravity" }),
+                  localAntigravity.tokens.total > 0
+            else { continue }
+
+            let key = localDay.dateKey
+            var dayUsage = daysMap[key] ?? DailyTokenUsage(
+                dateKey: key,
+                tokens: TokenBreakdown(),
+                agents: [],
+                estimatedCost: nil
+            )
+            var agents = dayUsage.agents
+
+            if let index = agents.firstIndex(where: { $0.agent == "antigravity" }) {
+                // 若本地解析出的 Antigravity Token 数量大于现有的，则取大值补全
+                if localAntigravity.tokens.total > agents[index].tokens.total {
+                    let diff = localAntigravity.tokens - agents[index].tokens
+                    agents[index] = localAntigravity
+                    dayUsage = DailyTokenUsage(
+                        dateKey: key,
+                        tokens: dayUsage.tokens + diff,
+                        agents: agents.sorted { $0.tokens.total > $1.tokens.total },
+                        estimatedCost: dayUsage.estimatedCost
+                    )
+                }
+            } else {
+                // 若原有结果中没有 Antigravity，直接追加合并
+                agents.append(localAntigravity)
+                dayUsage = DailyTokenUsage(
+                    dateKey: key,
+                    tokens: dayUsage.tokens + localAntigravity.tokens,
+                    agents: agents.sorted { $0.tokens.total > $1.tokens.total },
+                    estimatedCost: dayUsage.estimatedCost
+                )
+            }
+            daysMap[key] = dayUsage
+        }
+
+        let sortedKeys = daysMap.keys.sorted()
+        snapshot.days = sortedKeys.compactMap { daysMap[$0] }
     }
 
     static func parseTokscaleGraph(_ data: Data) throws -> TokenUsageSnapshot {
@@ -390,6 +523,9 @@ enum TokenUsageCollector {
         for contribution in graph.contributions {
             var day = DayAccumulator()
             day.tokens = contribution.tokenBreakdown.breakdown
+            let clientCosts = contribution.clients.compactMap(\.cost)
+            day.estimatedCost = contribution.totals?.cost
+                ?? (clientCosts.isEmpty ? nil : clientCosts.reduce(0, +))
 
             for item in contribution.clients where item.tokens.breakdown.total > 0 {
                 let client = item.client.lowercased()
@@ -659,20 +795,7 @@ enum TokenUsageCollector {
             home.appendingPathComponent(".volta/bin/node").path,
             home.appendingPathComponent(".bun/bin/node").path,
         ]
-        for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
-            return URL(fileURLWithPath: candidate)
-        }
-
-        guard let output = try? run(
-            URL(fileURLWithPath: "/bin/zsh"),
-            arguments: ["-lic", "command -v node"]
-        ), let path = String(data: output, encoding: .utf8)?
-            .split(whereSeparator: \.isNewline)
-            .first
-            .map(String.init),
-            FileManager.default.isExecutableFile(atPath: path)
-        else { return nil }
-        return URL(fileURLWithPath: path)
+        return ExecutableLocator.shared.locate("node", candidates: candidates, shellCommand: "command -v node")
     }
 
     private static func collectLocalLogs() -> TokenUsageSnapshot {
@@ -950,7 +1073,8 @@ enum TokenUsageCollector {
         for offset in (-29)...0 {
             guard let date = calendar.date(byAdding: .day, value: offset, to: today) else { continue }
             let key = dayKey(for: date)
-            let value = accumulators[key, default: DayAccumulator()]
+            let utcKey = utcDayKey(for: date)
+            let value = accumulators[key] ?? accumulators[utcKey] ?? DayAccumulator()
             let agents = value.agents.map { agent, tokens in
                 let models = (value.models[agent] ?? [:])
                     .map { ModelTokenUsage(name: $0.key, tokens: $0.value) }
@@ -958,25 +1082,41 @@ enum TokenUsageCollector {
                 return AgentTokenUsage(agent: agent, tokens: tokens, models: models)
             }
             .sorted { $0.tokens.total > $1.tokens.total }
-            days.append(DailyTokenUsage(dateKey: key, tokens: value.tokens, agents: agents))
+            days.append(
+                DailyTokenUsage(
+                    dateKey: key,
+                    tokens: value.tokens,
+                    agents: agents,
+                    estimatedCost: value.estimatedCost
+                )
+            )
         }
 
         return TokenUsageSnapshot(days: days, source: source, generatedAt: Date())
     }
 
-    private static func recentFiles(at root: URL, extension fileExtension: String, since date: Date) -> [URL] {
+    private static func recentFiles(
+        at root: URL,
+        extension fileExtension: String,
+        since date: Date,
+        maxSizeBytes: Int64 = 10 * 1024 * 1024
+    ) -> [URL] {
         guard let enumerator = FileManager.default.enumerator(
             at: root,
-            includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+            includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey],
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else { return [] }
 
         var files: [URL] = []
         for case let file as URL in enumerator where file.pathExtension.lowercased() == fileExtension {
-            guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey]) else {
+            guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey]) else {
                 continue
             }
-            guard values.isRegularFile == true, (values.contentModificationDate ?? .distantPast) >= date else {
+            // 过滤非普通文件、修改时间过早的文件以及超过大小限制（默认 10MB）的大日志
+            guard values.isRegularFile == true,
+                  (values.contentModificationDate ?? .distantPast) >= date,
+                  Int64(values.fileSize ?? 0) <= maxSizeBytes
+            else {
                 continue
             }
             files.append(file)
@@ -992,28 +1132,11 @@ enum TokenUsageCollector {
             home.appendingPathComponent(".local/bin/tokscale").path,
             home.appendingPathComponent(".bun/bin/tokscale").path,
         ]
-
-        for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
-            return URL(fileURLWithPath: candidate)
-        }
-
-        guard
-            let output = try? run(
-                URL(fileURLWithPath: "/bin/zsh"),
-                arguments: ["-lic", "command -v tokscale"]
-            ),
-            let path = String(data: output, encoding: .utf8)?
-                .split(whereSeparator: \.isNewline)
-                .first
-                .map(String.init),
-            FileManager.default.isExecutableFile(atPath: path)
-        else { return nil }
-
-        return URL(fileURLWithPath: path)
+        return ExecutableLocator.shared.locate("tokscale", candidates: candidates, shellCommand: "command -v tokscale")
     }
 
     @discardableResult
-    private static func run(_ executable: URL, arguments: [String]) throws -> Data {
+    private static func run(_ executable: URL, arguments: [String], timeout: TimeInterval = 15) throws -> Data {
         let process = Process()
         let output = Pipe()
         process.executableURL = executable
@@ -1027,10 +1150,22 @@ enum TokenUsageCollector {
         environment["NODE_USE_ENV_PROXY"] = "1"
         process.environment = environment
 
+        let timeoutWorkItem = DispatchWorkItem {
+            if process.isRunning {
+                process.terminate()
+            }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timeoutWorkItem)
+
         try process.run()
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
+        timeoutWorkItem.cancel()
+
         guard process.terminationStatus == 0 else {
+            if process.terminationReason == .uncaughtSignal {
+                throw CollectorError.processTimeout(executable.lastPathComponent)
+            }
             throw CollectorError.processFailed(executable.lastPathComponent)
         }
         return data
@@ -1062,6 +1197,15 @@ enum TokenUsageCollector {
         formatter.dateFormat = "yyyy-MM-dd"
         return formatter.string(from: date)
     }
+
+    private static func utcDayKey(for date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
 }
 
 extension Int64 {
@@ -1077,5 +1221,12 @@ extension Int64 {
         default:
             return "\(self)"
         }
+    }
+}
+
+extension Double {
+    var estimatedCostText: String {
+        let value = Swift.max(0, self)
+        return String(format: value > 0 && value < 0.01 ? "$%.3f" : "$%.2f", value)
     }
 }

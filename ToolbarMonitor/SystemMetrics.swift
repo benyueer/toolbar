@@ -92,7 +92,7 @@ final class SystemMetrics: ObservableObject {
     private func append(_ value: Double, to history: inout [Double]) {
         history.append(value)
         if history.count > historyLimit {
-            history.removeFirst(history.count - historyLimit)
+            history.removeFirst()
         }
     }
 

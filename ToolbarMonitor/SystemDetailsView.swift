@@ -305,8 +305,13 @@ private struct TokenDashboardView: View {
 
     private var summaryCards: some View {
         HStack(spacing: 7) {
-            TokenStatCard(title: "今日", value: snapshot.today.total.tokenText, detail: "tokens")
-            TokenStatCard(title: "7 天", value: snapshot.last7Days.total.tokenText, detail: "累计")
+            TokenStatCard(title: "今日 Token", value: snapshot.today.total.tokenText, detail: "tokens")
+            TokenStatCard(
+                title: "预估花费",
+                value: snapshot.todayEstimatedCost?.estimatedCostText ?? "$0.00",
+                detail: "今日预估",
+                valueColor: .green
+            )
             TokenStatCard(title: "30 天", value: snapshot.last30Days.total.tokenText, detail: "累计")
             TokenStatCard(
                 title: "Agents",
@@ -451,10 +456,42 @@ private struct TokenDashboardView: View {
                         Divider()
                     }
                 }
+
+                if period == .today {
+                    let allTimeAgents = snapshot.agents(last: 30).map(\.agent)
+                    let todayAgents = Set(selectedAgents.map(\.agent))
+                    let inactiveAgents = allTimeAgents.filter { !todayAgents.contains($0) }
+                    if !inactiveAgents.isEmpty {
+                        Divider()
+                        HStack(spacing: 5) {
+                            Text("今日无消耗:")
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(.tertiary)
+                            Text(inactiveAgents.map { agentDisplayName($0) }.joined(separator: " · "))
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                        .padding(.vertical, 7)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
             }
         }
         .padding(.horizontal, 11)
         .tokenCard()
+    }
+
+    private func agentDisplayName(_ agent: String) -> String {
+        switch agent.lowercased() {
+        case "codex": "Codex"
+        case "claude": "Claude Code"
+        case "gemini": "Gemini CLI"
+        case "antigravity": "Antigravity"
+        case "opencode": "OpenCode"
+        case "cursor": "Cursor"
+        case "copilot": "GitHub Copilot"
+        default: agent.capitalized
+        }
     }
 
     @ViewBuilder
@@ -526,6 +563,7 @@ private struct TokenStatCard: View {
     let title: String
     let value: String
     let detail: String
+    var valueColor: Color = .primary
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -534,6 +572,7 @@ private struct TokenStatCard: View {
                 .foregroundStyle(.secondary)
             Text(value)
                 .font(.system(size: 18, weight: .bold, design: .rounded))
+                .foregroundStyle(valueColor)
                 .monospacedDigit()
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
@@ -1148,16 +1187,73 @@ private struct MetricGauge: View {
 private struct HistoryChart: View {
     let cpu: [Double]
     let memory: [Double]
+    @State private var hoverLocation: CGPoint?
 
     var body: some View {
-        Canvas { context, size in
-            drawGrid(in: &context, size: size)
-            draw(cpu, color: .blue, in: &context, size: size)
-            draw(memory, color: .orange, in: &context, size: size)
+        GeometryReader { geometry in
+            ZStack(alignment: .topLeading) {
+                Canvas { context, size in
+                    drawGrid(in: &context, size: size)
+                    draw(cpu, color: .blue, in: &context, size: size)
+                    draw(memory, color: .orange, in: &context, size: size)
+                    if let location = hoverLocation {
+                        drawHoverIndicator(at: location, in: &context, size: size)
+                    }
+                }
+
+                if let location = hoverLocation, let index = sampleIndex(at: location.x, width: geometry.size.width) {
+                    let cpuVal = cpu.indices.contains(index) ? cpu[index] : 0
+                    let memVal = memory.indices.contains(index) ? memory[index] : 0
+                    let secondsAgo = (cpu.count - 1 - index)
+                    let timeText = secondsAgo == 0 ? "现在" : "\(secondsAgo)s 前"
+
+                    HStack(spacing: 6) {
+                        Text(timeText)
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundStyle(.secondary)
+                        Text("CPU \(cpuVal.percentText)")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(.blue)
+                        Text("内存 \(memVal.percentText)")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(.orange)
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 5))
+                    .shadow(radius: 2)
+                    .position(
+                        x: min(max(location.x, 70), geometry.size.width - 70),
+                        y: 12
+                    )
+                }
+            }
+            .contentShape(Rectangle())
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let location):
+                    hoverLocation = location
+                case .ended:
+                    hoverLocation = nil
+                }
+            }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("最近 3 分钟利用率")
         .accessibilityValue("CPU \(cpu.last?.percentText ?? "0%")，内存 \(memory.last?.percentText ?? "0%")")
+    }
+
+    private func sampleIndex(at x: CGFloat, width: CGFloat) -> Int? {
+        guard width > 0, !cpu.isEmpty else { return nil }
+        let ratio = max(0, min(1, x / width))
+        return Int((ratio * CGFloat(cpu.count - 1)).rounded())
+    }
+
+    private func drawHoverIndicator(at location: CGPoint, in context: inout GraphicsContext, size: CGSize) {
+        var line = Path()
+        line.move(to: CGPoint(x: location.x, y: 0))
+        line.addLine(to: CGPoint(x: location.x, y: size.height))
+        context.stroke(line, with: .color(.primary.opacity(0.35)), style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
     }
 
     private func drawGrid(in context: inout GraphicsContext, size: CGSize) {
@@ -1192,22 +1288,79 @@ private struct HistoryChart: View {
 private struct NetworkHistoryChart: View {
     let download: [Double]
     let upload: [Double]
+    @State private var hoverLocation: CGPoint?
 
     private var scaleMaximum: Double {
         max(download.max() ?? 0, upload.max() ?? 0, 1_000) * 1.1
     }
 
     var body: some View {
-        Canvas { context, size in
-            drawGrid(in: &context, size: size)
-            draw(download, color: .cyan, in: &context, size: size)
-            draw(upload, color: .purple, in: &context, size: size)
+        GeometryReader { geometry in
+            ZStack(alignment: .topLeading) {
+                Canvas { context, size in
+                    drawGrid(in: &context, size: size)
+                    draw(download, color: .cyan, in: &context, size: size)
+                    draw(upload, color: .purple, in: &context, size: size)
+                    if let location = hoverLocation {
+                        drawHoverIndicator(at: location, in: &context, size: size)
+                    }
+                }
+
+                if let location = hoverLocation, let index = sampleIndex(at: location.x, width: geometry.size.width) {
+                    let dlVal = download.indices.contains(index) ? download[index] : 0
+                    let ulVal = upload.indices.contains(index) ? upload[index] : 0
+                    let secondsAgo = (download.count - 1 - index)
+                    let timeText = secondsAgo == 0 ? "现在" : "\(secondsAgo)s 前"
+
+                    HStack(spacing: 6) {
+                        Text(timeText)
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundStyle(.secondary)
+                        Text("↓ \(dlVal.speedText)")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(.cyan)
+                        Text("↑ \(ulVal.speedText)")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(.purple)
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 5))
+                    .shadow(radius: 2)
+                    .position(
+                        x: min(max(location.x, 70), geometry.size.width - 70),
+                        y: 12
+                    )
+                }
+            }
+            .contentShape(Rectangle())
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let location):
+                    hoverLocation = location
+                case .ended:
+                    hoverLocation = nil
+                }
+            }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("最近 3 分钟网络速度")
         .accessibilityValue(
             "下载 \(download.last?.speedText ?? "0 B/s")，上传 \(upload.last?.speedText ?? "0 B/s")"
         )
+    }
+
+    private func sampleIndex(at x: CGFloat, width: CGFloat) -> Int? {
+        guard width > 0, !download.isEmpty else { return nil }
+        let ratio = max(0, min(1, x / width))
+        return Int((ratio * CGFloat(download.count - 1)).rounded())
+    }
+
+    private func drawHoverIndicator(at location: CGPoint, in context: inout GraphicsContext, size: CGSize) {
+        var line = Path()
+        line.move(to: CGPoint(x: location.x, y: 0))
+        line.addLine(to: CGPoint(x: location.x, y: size.height))
+        context.stroke(line, with: .color(.primary.opacity(0.35)), style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
     }
 
     private func drawGrid(in context: inout GraphicsContext, size: CGSize) {
