@@ -28,7 +28,23 @@ struct SystemDetailsView: View {
             footer
         }
         .frame(width: 420, height: 680)
-        .background(.regularMaterial)
+        .background(
+            ZStack {
+                Color(nsColor: .windowBackgroundColor)
+                    .opacity(0.85)
+
+                LinearGradient(
+                    colors: [
+                        Color.black.opacity(0.12),
+                        Color.indigo.opacity(0.06),
+                        Color.purple.opacity(0.04),
+                        Color.black.opacity(0.08)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            }
+        )
     }
 
     private var systemDashboard: some View {
@@ -138,7 +154,7 @@ struct SystemDetailsView: View {
             .frame(height: 58)
         }
         .padding(12)
-        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
+        .tokenCard()
     }
 
     private var detailRows: some View {
@@ -203,7 +219,7 @@ struct SystemDetailsView: View {
             .foregroundStyle(.tertiary)
         }
         .padding(12)
-        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
+        .tokenCard()
     }
 
     private var networkScaleMaximum: Double {
@@ -396,6 +412,7 @@ private struct TokenDashboardView: View {
 
             TokenActivityStrip(days: snapshot.days)
                 .frame(height: 42)
+                .zIndex(1)
 
             HStack {
                 Text("30 天前")
@@ -591,30 +608,107 @@ private struct TokenStatCard: View {
 
 private struct TokenActivityStrip: View {
     let days: [DailyTokenUsage]
+    @State private var hoveredDay: DailyTokenUsage? = nil
+    @State private var hoveredIndex: Int? = nil
 
     var body: some View {
         GeometryReader { geometry in
             let maximum = max(days.map(\.tokens.total).max() ?? 0, 1)
             let gap: CGFloat = 2
-            let width = max(1, (geometry.size.width - gap * CGFloat(max(days.count - 1, 0))) / CGFloat(max(days.count, 1)))
+            let totalGap = gap * CGFloat(max(days.count - 1, 0))
+            let width = max(1, (geometry.size.width - totalGap) / CGFloat(max(days.count, 1)))
 
-            HStack(alignment: .bottom, spacing: gap) {
-                ForEach(days) { day in
-                    let ratio = Double(day.tokens.total) / Double(maximum)
-                    RoundedRectangle(cornerRadius: min(width / 2, 2))
-                        .fill(
-                            day.tokens.total == 0
-                                ? Color.primary.opacity(0.06)
-                                : Color.indigo.opacity(0.28 + ratio * 0.72)
-                        )
-                        .frame(width: width, height: max(3, geometry.size.height * CGFloat(ratio)))
+            ZStack(alignment: .topLeading) {
+                HStack(alignment: .bottom, spacing: gap) {
+                    ForEach(Array(days.enumerated()), id: \.element.id) { index, day in
+                        let ratio = Double(day.tokens.total) / Double(maximum)
+                        let isHovered = hoveredDay?.id == day.id
+
+                        ZStack(alignment: .bottom) {
+                            Rectangle()
+                                .fill(Color.clear)
+                                .contentShape(Rectangle())
+
+                            RoundedRectangle(cornerRadius: min(width / 2, 2))
+                                .fill(
+                                    day.tokens.total == 0
+                                        ? (isHovered ? Color.primary.opacity(0.18) : Color.primary.opacity(0.06))
+                                        : (isHovered ? Color.indigo : Color.indigo.opacity(0.28 + ratio * 0.72))
+                                )
+                                .frame(width: width, height: max(3, geometry.size.height * CGFloat(ratio)))
+                                .scaleEffect(x: isHovered ? 1.25 : 1.0, y: isHovered ? 1.08 : 1.0, anchor: .bottom)
+                                .shadow(color: isHovered ? Color.indigo.opacity(0.35) : Color.clear, radius: isHovered ? 2 : 0)
+                        }
+                        .frame(width: width, height: geometry.size.height)
+                        .onHover { hovering in
+                            if hovering {
+                                hoveredDay = day
+                                hoveredIndex = index
+                            } else if hoveredDay?.id == day.id {
+                                hoveredDay = nil
+                                hoveredIndex = nil
+                            }
+                        }
                         .help("\(day.dateKey) · \(day.tokens.total.tokenText)")
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+
+                if let day = hoveredDay, let index = hoveredIndex {
+                    let barCenterX = CGFloat(index) * (width + gap) + width / 2
+                    let tooltipWidth: CGFloat = 110
+                    let halfTooltip = tooltipWidth / 2
+                    let clampedX = min(max(barCenterX, halfTooltip), geometry.size.width - halfTooltip)
+
+                    VStack(spacing: 2) {
+                        Text(formatDateKey(day.dateKey))
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.secondary)
+
+                        HStack(spacing: 3) {
+                            Text(day.tokens.total.tokenText)
+                                .font(.system(size: 11, weight: .bold, design: .rounded))
+                                .monospacedDigit()
+                                .foregroundStyle(.primary)
+
+                            Text("tokens")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.tertiary)
+                        }
+
+                        if let cost = day.estimatedCost, cost > 0 {
+                            Text("预估 $\(String(format: "%.3f", cost))")
+                                .font(.system(size: 8))
+                                .foregroundStyle(.green)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(.ultraThinMaterial)
+                            .shadow(color: .black.opacity(0.18), radius: 4, x: 0, y: 2)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .stroke(Color.primary.opacity(0.12), lineWidth: 0.5)
+                            )
+                    )
+                    .position(x: clampedX, y: -16)
+                    .allowsHitTesting(false)
+                    .animation(.spring(response: 0.18, dampingFraction: 0.8), value: hoveredIndex)
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("最近 30 天 Token 活动")
+    }
+
+    private func formatDateKey(_ key: String) -> String {
+        let parts = key.split(separator: "-")
+        if parts.count == 3, let month = Int(parts[1]), let day = Int(parts[2]) {
+            return "\(month)月\(day)日"
+        }
+        return key
     }
 }
 
@@ -1100,12 +1194,40 @@ private struct AgentBrandLogo: View {
 private extension View {
     func tokenCard() -> some View {
         background(
-            RoundedRectangle(cornerRadius: 9)
-                .fill(Color.primary.opacity(0.045))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 9)
-                        .strokeBorder(Color.primary.opacity(0.075), lineWidth: 0.5)
-                )
+            ZStack {
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(.ultraThinMaterial)
+
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(0.18),
+                                Color.white.opacity(0.03),
+                                Color.black.opacity(0.05)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(0.45),
+                                Color.white.opacity(0.12),
+                                Color.indigo.opacity(0.20),
+                                Color.primary.opacity(0.06)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 0.75
+                    )
+            }
+            .shadow(color: Color.black.opacity(0.12), radius: 6, x: 0, y: 3)
+            .shadow(color: Color.indigo.opacity(0.08), radius: 10, x: 0, y: 4)
         )
     }
 }

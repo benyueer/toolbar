@@ -161,12 +161,7 @@ struct TokenUsageSnapshot: Equatable, Sendable {
     static let empty = TokenUsageSnapshot()
 
     var today: TokenBreakdown { totals(last: 1) }
-    var todayEstimatedCost: Double? {
-        if let cost = selectedDays(last: 1).first?.estimatedCost, cost > 0 {
-            return cost
-        }
-        return days.reversed().first(where: { ($0.estimatedCost ?? 0) > 0 })?.estimatedCost
-    }
+    var todayEstimatedCost: Double? { selectedDays(last: 1).first?.estimatedCost }
     var last7Days: TokenBreakdown { totals(last: 7) }
     var last30Days: TokenBreakdown { totals(last: 30) }
 
@@ -270,7 +265,7 @@ final class TokenUsageMonitor: ObservableObject {
             switch result {
             case .success(let nextSnapshot):
                 snapshot = nextSnapshot
-                if shouldSync, nextSnapshot.source == .tokscale {
+                if shouldSync, nextSnapshot.source == .tokscale, nextSnapshot.antigravitySynced {
                     lastAntigravitySync = Date()
                 }
                 if shouldRefreshQuotas, nextSnapshot.quotaSource == .embeddedTokenTracker {
@@ -322,6 +317,19 @@ enum TokenUsageCollector {
                 reasoning: reasoning
             )
         }
+    }
+
+    private struct AntigravityStatus: Decodable {
+        let cacheExists: Bool
+        let sessionsDirExists: Bool
+        let manifestExists: Bool
+        let detectedConnections: Int
+        let lastSyncedAt: String?
+    }
+
+    private struct AntigravitySyncOutcome {
+        let synced: Bool
+        let note: String?
     }
 
     private struct DayAccumulator {
@@ -402,10 +410,9 @@ enum TokenUsageCollector {
             var snapshot: TokenUsageSnapshot
             if let executable = locateTokscale() {
                 do {
-                    var antigravitySynced = false
-                    if syncAntigravity, let syncOutput = try? run(executable, arguments: ["antigravity", "sync"], timeout: 15) {
-                        antigravitySynced = detectedAntigravityConnection(in: syncOutput)
-                    }
+                    let antigravitySync = syncAntigravity
+                        ? synchronizeAntigravity(using: executable)
+                        : AntigravitySyncOutcome(synced: false, note: nil)
 
                     let start = dayKey(for: Calendar.current.date(byAdding: .day, value: -29, to: Date()) ?? Date())
                     let data = try run(
@@ -415,7 +422,8 @@ enum TokenUsageCollector {
                     )
                     snapshot = try parseTokscaleGraph(data)
                     snapshot.source = .tokscale
-                    snapshot.antigravitySynced = antigravitySynced
+                    snapshot.antigravitySynced = antigravitySync.synced
+                    snapshot.note = antigravitySync.note
 
                     let localSnapshot = collectLocalLogs()
                     mergeAntigravityDataIfNeeded(into: &snapshot, from: localSnapshot)
@@ -1073,8 +1081,7 @@ enum TokenUsageCollector {
         for offset in (-29)...0 {
             guard let date = calendar.date(byAdding: .day, value: offset, to: today) else { continue }
             let key = dayKey(for: date)
-            let utcKey = utcDayKey(for: date)
-            let value = accumulators[key] ?? accumulators[utcKey] ?? DayAccumulator()
+            let value = accumulators[key] ?? DayAccumulator()
             let agents = value.agents.map { agent, tokens in
                 let models = (value.models[agent] ?? [:])
                     .map { ModelTokenUsage(name: $0.key, tokens: $0.value) }
@@ -1177,10 +1184,96 @@ enum TokenUsageCollector {
         return 0
     }
 
-    private static func detectedAntigravityConnection(in output: Data) -> Bool {
-        guard let text = String(data: output, encoding: .utf8) else { return false }
-        let pattern = #"detected connections:\s*([1-9][0-9]*)"#
-        return text.range(of: pattern, options: .regularExpression) != nil
+    private static func synchronizeAntigravity(using executable: URL) -> AntigravitySyncOutcome {
+        var latestStatus = try? readAntigravityStatus(using: executable)
+        var expectedConnections = latestStatus?.detectedConnections ?? 0
+        var synchronizedConnections = 0
+        var completedSync = false
+
+        // Antigravity 的全局与工作区 language server 可能分两轮才被发现。
+        // 每轮 sync 后重新读取 status；仅当 status 看到了尚未同步的连接时再补一次。
+        for attempt in 1...2 {
+            do {
+                let output = try run(
+                    executable,
+                    arguments: ["antigravity", "sync"],
+                    timeout: 30
+                )
+                completedSync = true
+                synchronizedConnections = max(
+                    synchronizedConnections,
+                    antigravityConnectionCount(in: output) ?? 0
+                )
+            } catch {
+                if attempt == 2 {
+                    break
+                }
+                continue
+            }
+
+            if let status = try? readAntigravityStatus(using: executable) {
+                latestStatus = status
+                expectedConnections = max(expectedConnections, status.detectedConnections)
+            }
+
+            if synchronizedConnections >= expectedConnections {
+                break
+            }
+        }
+
+        guard completedSync else {
+            return AntigravitySyncOutcome(
+                synced: false,
+                note: "反重力同步失败，稍后将自动重试"
+            )
+        }
+
+        let visibleConnections = max(expectedConnections, latestStatus?.detectedConnections ?? 0)
+        guard visibleConnections > 0 else {
+            return AntigravitySyncOutcome(
+                synced: false,
+                note: "未检测到反重力语言服务，稍后将自动重试"
+            )
+        }
+
+        guard synchronizedConnections >= visibleConnections else {
+            return AntigravitySyncOutcome(
+                synced: false,
+                note: "反重力仅同步 \(synchronizedConnections)/\(visibleConnections) 个语言服务，稍后将自动重试"
+            )
+        }
+
+        if let status = latestStatus,
+           !status.cacheExists || !status.sessionsDirExists || !status.manifestExists || status.lastSyncedAt == nil {
+            return AntigravitySyncOutcome(
+                synced: false,
+                note: "反重力缓存状态异常，稍后将自动重试"
+            )
+        }
+
+        return AntigravitySyncOutcome(synced: true, note: nil)
+    }
+
+    private static func readAntigravityStatus(using executable: URL) throws -> AntigravityStatus {
+        let data = try run(
+            executable,
+            arguments: ["antigravity", "status", "--json"],
+            timeout: 15
+        )
+        return try JSONDecoder().decode(AntigravityStatus.self, from: data)
+    }
+
+    private static func antigravityConnectionCount(in output: Data) -> Int? {
+        guard let text = String(data: output, encoding: .utf8) else { return nil }
+        for line in text.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: ":", maxSplits: 1)
+            guard
+                parts.count == 2,
+                parts[0].trimmingCharacters(in: .whitespacesAndNewlines) == "detected connections"
+            else { continue }
+            return Int(parts[1].trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return nil
     }
 
     private static func parseISODate(_ value: String) -> Date? {
@@ -1198,14 +1291,6 @@ enum TokenUsageCollector {
         return formatter.string(from: date)
     }
 
-    private static func utcDayKey(for date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: date)
-    }
 }
 
 extension Int64 {
