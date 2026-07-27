@@ -133,12 +133,12 @@ struct ProviderQuotaUsage: Identifiable, Equatable, Sendable {
 
 struct TokenUsageSnapshot: Equatable, Sendable {
     enum Source: String, Sendable {
-        case tokscale
+        case embeddedCollector
         case localLogs
 
         var label: String {
             switch self {
-            case .tokscale: "tokscale 标准化统计"
+            case .embeddedCollector: "内置标准化统计"
             case .localLogs: "本地日志回退"
             }
         }
@@ -265,7 +265,7 @@ final class TokenUsageMonitor: ObservableObject {
             switch result {
             case .success(let nextSnapshot):
                 snapshot = nextSnapshot
-                if shouldSync, nextSnapshot.source == .tokscale, nextSnapshot.antigravitySynced {
+                if shouldSync, nextSnapshot.source == .embeddedCollector, nextSnapshot.antigravitySynced {
                     lastAntigravitySync = Date()
                 }
                 if shouldRefreshQuotas, nextSnapshot.quotaSource == .embeddedTokenTracker {
@@ -339,14 +339,16 @@ enum TokenUsageCollector {
         var estimatedCost: Double?
     }
 
+    private static let usageCollectorStorageLock = NSLock()
+
     private enum CollectorError: LocalizedError {
-        case invalidTokscaleOutput
+        case invalidCollectorOutput
         case processFailed(String)
         case processTimeout(String)
 
         var errorDescription: String? {
             switch self {
-            case .invalidTokscaleOutput: "无法解析 tokscale 的统计结果"
+            case .invalidCollectorOutput: "无法解析内置统计引擎的结果"
             case .processFailed(let command): "Token 统计命令执行失败：\(command)"
             case .processTimeout(let command): "Token 统计命令执行超时：\(command)"
             }
@@ -405,10 +407,10 @@ enum TokenUsageCollector {
         cachedQuotas: [ProviderQuotaUsage] = [],
         cachedQuotaSource: TokenUsageSnapshot.QuotaSource? = nil
     ) async throws -> TokenUsageSnapshot {
-        // 并行任务 1：从 tokscale / 本地日志拉取 Token 使用量与同步记录
+        // 并行任务 1：从内置统计引擎 / 本地日志拉取 Token 使用量与同步记录
         async let snapshotTask = Task.detached(priority: .userInitiated) { () -> TokenUsageSnapshot in
             var snapshot: TokenUsageSnapshot
-            if let executable = locateTokscale() {
+            if let executable = locateEmbeddedUsageCollector() {
                 do {
                     let antigravitySync = syncAntigravity
                         ? synchronizeAntigravity(using: executable)
@@ -420,19 +422,20 @@ enum TokenUsageCollector {
                         arguments: ["graph", "--since", start, "--no-spinner"],
                         timeout: 15
                     )
-                    snapshot = try parseTokscaleGraph(data)
-                    snapshot.source = .tokscale
+                    snapshot = try parseUsageGraph(data)
+                    snapshot.source = .embeddedCollector
                     snapshot.antigravitySynced = antigravitySync.synced
                     snapshot.note = antigravitySync.note
 
-                    let localSnapshot = collectLocalLogs()
+                    let localSnapshot = collectLocalAntigravity()
                     mergeAntigravityDataIfNeeded(into: &snapshot, from: localSnapshot)
                 } catch {
                     snapshot = collectLocalLogs()
-                    snapshot.note = "tokscale 暂时不可用，已改用本地日志统计"
+                    snapshot.note = "内置统计引擎暂时不可用，已改用本地日志统计"
                 }
             } else {
                 snapshot = collectLocalLogs()
+                snapshot.note = "未找到内置统计引擎，已改用本地日志统计"
             }
             return snapshot
         }.value
@@ -472,7 +475,7 @@ enum TokenUsageCollector {
         return finalSnapshot
     }
 
-    /// 确保在 tokscale graph 与本地 Antigravity 缓存之间取并集，防止任何新导出的 Antigravity Token 遗漏
+    /// 确保在内置聚合结果与本地 Antigravity 缓存之间取并集，防止任何新导出的 Token 遗漏
     private static func mergeAntigravityDataIfNeeded(
         into snapshot: inout TokenUsageSnapshot,
         from localSnapshot: TokenUsageSnapshot
@@ -522,9 +525,9 @@ enum TokenUsageCollector {
         snapshot.days = sortedKeys.compactMap { daysMap[$0] }
     }
 
-    static func parseTokscaleGraph(_ data: Data) throws -> TokenUsageSnapshot {
+    static func parseUsageGraph(_ data: Data) throws -> TokenUsageSnapshot {
         guard let graph = try? JSONDecoder().decode(GraphPayload.self, from: data) else {
-            throw CollectorError.invalidTokscaleOutput
+            throw CollectorError.invalidCollectorOutput
         }
 
         var accumulators: [String: DayAccumulator] = [:]
@@ -546,12 +549,12 @@ enum TokenUsageCollector {
             accumulators[contribution.date] = day
         }
 
-        return makeSnapshot(from: accumulators, source: .tokscale)
+        return makeSnapshot(from: accumulators, source: .embeddedCollector)
     }
 
     static func parseEmbeddedTokenTrackerLimits(_ data: Data) throws -> [ProviderQuotaUsage] {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw CollectorError.invalidTokscaleOutput
+            throw CollectorError.invalidCollectorOutput
         }
 
         func object(_ value: Any?) -> [String: Any]? {
@@ -836,8 +839,22 @@ enum TokenUsageCollector {
             earliestDate: earliestDate,
             into: &accumulators
         )
+
         parseAntigravityCache(
-            root: home.appendingPathComponent(".config/tokscale/antigravity-cache/sessions"),
+            root: prepareUsageCollectorStorage().appendingPathComponent("antigravity-cache/sessions"),
+            earliestDate: earliestDate,
+            into: &accumulators
+        )
+
+        return makeSnapshot(from: accumulators, source: .localLogs)
+    }
+
+    private static func collectLocalAntigravity() -> TokenUsageSnapshot {
+        var accumulators: [String: DayAccumulator] = [:]
+        let earliestDate = Calendar.current.date(byAdding: .day, value: -31, to: Date()) ?? Date()
+        let collectorConfig = prepareUsageCollectorStorage()
+        parseAntigravityCache(
+            root: collectorConfig.appendingPathComponent("antigravity-cache/sessions"),
             earliestDate: earliestDate,
             into: &accumulators
         )
@@ -1131,15 +1148,52 @@ enum TokenUsageCollector {
         return files.sorted { $0.path < $1.path }
     }
 
-    private static func locateTokscale() -> URL? {
-        let home = FileManager.default.homeDirectoryForCurrentUser
+    private static func locateEmbeddedUsageCollector() -> URL? {
+        let sourceDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
         let candidates = [
-            "/opt/homebrew/bin/tokscale",
-            "/usr/local/bin/tokscale",
-            home.appendingPathComponent(".local/bin/tokscale").path,
-            home.appendingPathComponent(".bun/bin/tokscale").path,
-        ]
-        return ExecutableLocator.shared.locate("tokscale", candidates: candidates, shellCommand: "command -v tokscale")
+            Bundle.main.resourceURL?.appendingPathComponent("UsageCollectorBackend/usage-collector"),
+            sourceDirectory.appendingPathComponent("Resources/UsageCollectorBackend/usage-collector"),
+        ].compactMap { $0 }
+        return candidates.first {
+            FileManager.default.isExecutableFile(atPath: $0.path)
+        }
+    }
+
+    private static func usageCollectorConfigDirectory() -> URL {
+        let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support", isDirectory: true)
+        return applicationSupport
+            .appendingPathComponent("ToolbarMonitor", isDirectory: true)
+            .appendingPathComponent("UsageCollector", isDirectory: true)
+    }
+
+    /// 首次升级时只复制仍有价值的本地缓存，后续全部写入 ToolbarMonitor 自己的目录。
+    private static func prepareUsageCollectorStorage() -> URL {
+        usageCollectorStorageLock.lock()
+        defer { usageCollectorStorageLock.unlock() }
+
+        let fileManager = FileManager.default
+        let destinationRoot = usageCollectorConfigDirectory()
+        try? fileManager.createDirectory(
+            at: destinationRoot,
+            withIntermediateDirectories: true
+        )
+
+        let legacyRoot = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/tokscale", isDirectory: true)
+        for directoryName in ["antigravity-cache", "cursor-cache", "trae-cache"] {
+            let source = legacyRoot.appendingPathComponent(directoryName, isDirectory: true)
+            let destination = destinationRoot.appendingPathComponent(directoryName, isDirectory: true)
+            guard fileManager.fileExists(atPath: source.path),
+                  !fileManager.fileExists(atPath: destination.path)
+            else { continue }
+            try? fileManager.copyItem(at: source, to: destination)
+        }
+
+        return destinationRoot
     }
 
     @discardableResult
@@ -1153,8 +1207,11 @@ enum TokenUsageCollector {
 
         var environment = ProcessInfo.processInfo.environment
         environment["NO_COLOR"] = "1"
-        environment["TOKSCALE_NATIVE_TIMEOUT_MS"] = "45000"
         environment["NODE_USE_ENV_PROXY"] = "1"
+        if executable.lastPathComponent == "usage-collector" {
+            environment["TOKSCALE_CONFIG_DIR"] = prepareUsageCollectorStorage().path
+            environment["TOKSCALE_NATIVE_TIMEOUT_MS"] = "45000"
+        }
         process.environment = environment
 
         let timeoutWorkItem = DispatchWorkItem {
