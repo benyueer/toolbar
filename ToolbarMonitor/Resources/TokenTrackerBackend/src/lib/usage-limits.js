@@ -2826,100 +2826,133 @@ async function fetchUsageLimitsUncached({
   now = new Date(),
   providerTimeoutMs = DEFAULT_PROVIDER_TIMEOUT_MS,
   forceRefresh = false,
+  providers = null,
 } = {}) {
-  const nowMs = Date.now();
+  const nowMs = Date.now()
+
+  // 若指定了目标 Provider 列表，则只请求指定的平台，避免无关探测与请求开销
+  const requestedProviders = Array.isArray(providers) && providers.length > 0
+    ? new Set(providers.map((p) => p.toLowerCase()))
+    : null
+  const shouldRun = (name) => !requestedProviders || requestedProviders.has(name.toLowerCase())
+  const shouldRunClaude = shouldRun('claude')
+  const shouldRunCodex = shouldRun('codex')
 
   const [claudeToken, claudeSubscription, codexAuth] = await Promise.all([
-    Promise.resolve().then(() => readClaudeCodeAccessToken({ platform, securityRunner, home })),
-    Promise.resolve().then(() => detectClaudeCodeSubscriptionDetails({ platform, securityRunner, home })),
-    readCodexAuthBundle({ home, env }),
-  ]);
-  const claudePlanType = claudeSubscription?.planType || null;
+    shouldRunClaude
+      ? Promise.resolve().then(() => readClaudeCodeAccessToken({ platform, securityRunner, home }))
+      : Promise.resolve(null),
+    shouldRunClaude
+      ? Promise.resolve().then(() => detectClaudeCodeSubscriptionDetails({ platform, securityRunner, home }))
+      : Promise.resolve(null),
+    shouldRunCodex
+      ? readCodexAuthBundle({ home, env })
+      : Promise.resolve(null),
+  ])
+  const claudePlanType = claudeSubscription?.planType || null
 
   // Proactively refresh Codex tokens that are >8 days stale, mirroring CodexBar's
   // CodexTokenRefresher.swift. Without this, users who logged in once and didn't run
   // `codex` for >a week get wham 401 → "Fetch failed" (issue #52). Best-effort: any
   // refresh failure falls through to using the existing (possibly stale) token, then the
   // 4xx graceful path in fetchCodexUsageLimits surfaces a neutral state instead of red.
-  let refreshError = null;
-  let codexAuthRefreshed = codexAuth;
-  if (codexAuth && isTokenStale(codexAuth.lastRefresh) && codexAuth.refreshToken) {
+  let refreshError = null
+  let codexAuthRefreshed = codexAuth
+  if (shouldRunCodex && codexAuth && isTokenStale(codexAuth.lastRefresh) && codexAuth.refreshToken) {
     try {
       const newTokens = await refreshCodexTokens({
         refreshToken: codexAuth.refreshToken,
         fetchImpl,
-      });
+      })
       const updatedAuth = await persistRefreshedAuth(
         codexAuth.authPath,
         codexAuth.authJson,
         newTokens,
-      );
+      )
       codexAuthRefreshed = {
         ...codexAuth,
         accessToken: newTokens.access_token,
         refreshToken: newTokens.refresh_token,
         lastRefresh: updatedAuth.last_refresh,
         authJson: updatedAuth,
-      };
+      }
     } catch (err) {
-      refreshError = err;
+      refreshError = err
     }
   }
 
-  const codexToken = codexAuthRefreshed?.accessToken || null;
-  const codexAccountId = codexAuthRefreshed?.accountId || null;
-  const codexPlanType = codexAuthRefreshed?.planType || null;
+  const codexToken = codexAuthRefreshed?.accessToken || null
+  const codexAccountId = codexAuthRefreshed?.accountId || null
+  const codexPlanType = codexAuthRefreshed?.planType || null
 
   // Skip the upstream Claude call entirely while a 429 cooldown is active — calling again
   // just renews the penalty. The result handling below serves cache or a cooldown message.
-  const claudeRetryAtMs = claudeToken ? readClaudeRateLimitRetryAtMs({ home, nowMs }) : null;
+  const claudeRetryAtMs = (shouldRunClaude && claudeToken) ? readClaudeRateLimitRetryAtMs({ home, nowMs }) : null
   // Also avoid cross-process hammering after a recent successful read: embedded-server
   // restarts and background polls read the disk cache instead of spending another Claude
   // OAuth usage request. An explicit user refresh (refresh=1 → forceRefresh) punches
   // through this cache — but never through the 429 cooldown above, which is exactly the
   // hammering the cooldown exists to prevent.
-  const freshClaudeCache = claudeToken && !forceRefresh
+  const freshClaudeCache = (shouldRunClaude && claudeToken && !forceRefresh)
     ? readFreshClaudeLimitsCache({ home, nowMs })
-    : null;
+    : null
 
-  const providerFetch = withFetchTimeout(fetchImpl, providerTimeoutMs);
+  const providerFetch = withFetchTimeout(fetchImpl, providerTimeoutMs)
   const [claudeResult, codexResult, cursor, kimi, gemini, kiro, antigravity, copilot, grok, zcode, opencodeGo] = await Promise.all([
-    claudeToken && !freshClaudeCache && !claudeRetryAtMs
-      ? withProviderTimeout(fetchClaudeUsageLimits(claudeToken, { fetchImpl: providerFetch, maxAttempts: 1 }), "Claude", providerTimeoutMs).then(
-          (value) => ({ status: "fulfilled", value }),
-          (reason) => ({ status: "rejected", reason }),
+    shouldRunClaude && claudeToken && !freshClaudeCache && !claudeRetryAtMs
+      ? withProviderTimeout(fetchClaudeUsageLimits(claudeToken, { fetchImpl: providerFetch, maxAttempts: 1 }), 'Claude', providerTimeoutMs).then(
+          (value) => ({ status: 'fulfilled', value }),
+          (reason) => ({ status: 'rejected', reason }),
         )
       : Promise.resolve(null),
-    codexToken
+    shouldRunCodex && codexToken
       ? fetchCodexUsageLimits(codexToken, {
           fetchImpl: providerFetch,
           accountId: codexAccountId,
           providerTimeoutMs,
         }).then(
-          (value) => ({ status: "fulfilled", value }),
-          (reason) => ({ status: "rejected", reason }),
+          (value) => ({ status: 'fulfilled', value }),
+          (reason) => ({ status: 'rejected', reason }),
         )
       : Promise.resolve(null),
-    withProviderTimeout(fetchCursorLimits({ home, fetchImpl: providerFetch }), "Cursor", providerTimeoutMs)
-      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
-    withProviderTimeout(fetchKimiLimits({ home, env, fetchImpl: providerFetch }), "Kimi", providerTimeoutMs)
-      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
-    withProviderTimeout(fetchGeminiLimits({ home, env, fetchImpl: providerFetch, commandRunner }), "Gemini", providerTimeoutMs)
-      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
-    fetchKiroLimits({ commandRunner, now }),
-    fetchAntigravityLimits({ home, commandRunner, requestFn, fetchImpl: providerFetch, nowMs }),
-    withProviderTimeout(fetchCopilotLimits({ home, env, fetchImpl: providerFetch, platform, securityRunner }), "GitHub Copilot", providerTimeoutMs)
-      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
-    withProviderTimeout(fetchGrokLimits({ home, env, fetchImpl: providerFetch }), "Grok Build", providerTimeoutMs)
-      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
-    withProviderTimeout(fetchZcodeLimits({ home, env, fetchImpl: providerFetch }), "ZCode", providerTimeoutMs)
-      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
+    shouldRun('cursor')
+      ? withProviderTimeout(fetchCursorLimits({ home, fetchImpl: providerFetch }), 'Cursor', providerTimeoutMs)
+          .catch((reason) => ({ configured: true, error: reason?.message || 'Unknown error' }))
+      : Promise.resolve({ configured: false }),
+    shouldRun('kimi')
+      ? withProviderTimeout(fetchKimiLimits({ home, env, fetchImpl: providerFetch }), 'Kimi', providerTimeoutMs)
+          .catch((reason) => ({ configured: true, error: reason?.message || 'Unknown error' }))
+      : Promise.resolve({ configured: false }),
+    shouldRun('gemini')
+      ? withProviderTimeout(fetchGeminiLimits({ home, env, fetchImpl: providerFetch, commandRunner }), 'Gemini', providerTimeoutMs)
+          .catch((reason) => ({ configured: true, error: reason?.message || 'Unknown error' }))
+      : Promise.resolve({ configured: false }),
+    shouldRun('kiro')
+      ? fetchKiroLimits({ commandRunner, now })
+      : Promise.resolve({ configured: false }),
+    shouldRun('antigravity')
+      ? fetchAntigravityLimits({ home, commandRunner, requestFn, fetchImpl: providerFetch, nowMs })
+      : Promise.resolve({ configured: false }),
+    shouldRun('copilot')
+      ? withProviderTimeout(fetchCopilotLimits({ home, env, fetchImpl: providerFetch, platform, securityRunner }), 'GitHub Copilot', providerTimeoutMs)
+          .catch((reason) => ({ configured: true, error: reason?.message || 'Unknown error' }))
+      : Promise.resolve({ configured: false }),
+    shouldRun('grok')
+      ? withProviderTimeout(fetchGrokLimits({ home, env, fetchImpl: providerFetch }), 'Grok Build', providerTimeoutMs)
+          .catch((reason) => ({ configured: true, error: reason?.message || 'Unknown error' }))
+      : Promise.resolve({ configured: false }),
+    shouldRun('zcode')
+      ? withProviderTimeout(fetchZcodeLimits({ home, env, fetchImpl: providerFetch }), 'ZCode', providerTimeoutMs)
+          .catch((reason) => ({ configured: true, error: reason?.message || 'Unknown error' }))
+      : Promise.resolve({ configured: false }),
     // OpenCode Go: local opencode.db cost-vs-dollar-cap estimate by default
     // (auth-free, zero-config), upgraded to the exact server-side scrape when an
     // OPENCODE_GO_AUTH_COOKIE is set. See src/lib/opencode-go-limits.js.
-    withProviderTimeout(fetchOpencodeGoLimits({ home, env, fetchImpl: providerFetch }), "OpenCode Go", providerTimeoutMs)
-      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
-  ]);
+    shouldRun('opencodeGo') || shouldRun('opencode')
+      ? withProviderTimeout(fetchOpencodeGoLimits({ home, env, fetchImpl: providerFetch }), 'OpenCode Go', providerTimeoutMs)
+          .catch((reason) => ({ configured: true, error: reason?.message || 'Unknown error' }))
+      : Promise.resolve({ configured: false }),
+  ])
 
   let claude;
   if (!claudeToken) {

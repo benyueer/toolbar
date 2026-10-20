@@ -53,6 +53,7 @@ struct AgentTokenUsage: Identifiable, Equatable, Sendable {
         case "claude": "Claude Code"
         case "gemini": "Gemini CLI"
         case "antigravity": "Antigravity"
+        case "agy-cli", "antigravity-cli", "agy": "Agy CLI"
         case "opencode": "OpenCode"
         case "cursor": "Cursor"
         case "copilot": "GitHub Copilot"
@@ -118,6 +119,7 @@ struct ProviderQuotaUsage: Identifiable, Equatable, Sendable {
         if key.contains("codex") { return "codex" }
         if key.contains("claude") { return "claude" }
         if key.contains("antigravity") { return "antigravity" }
+        if key.contains("agy") { return "agy-cli" }
         if key.contains("gemini") { return "gemini" }
         if key.contains("opencode") { return "opencode" }
         if key.contains("cursor") { return "cursor" }
@@ -204,6 +206,9 @@ struct TokenUsageSnapshot: Equatable, Sendable {
 final class TokenUsageMonitor: ObservableObject {
     @Published private(set) var snapshot = TokenUsageSnapshot.empty
     @Published private(set) var isRefreshing = false
+    @Published private(set) var isQuotaRefreshing = false
+    @Published private(set) var isUsageRefreshing = false
+    @Published private(set) var lastUsageRefresh: Date? = Date()
     @Published private(set) var errorMessage: String?
 
     private let refreshInterval: TimeInterval = 3 * 60
@@ -240,6 +245,8 @@ final class TokenUsageMonitor: ObservableObject {
         let cachedQuotaSource = snapshot.quotaSource
 
         isRefreshing = true
+        isQuotaRefreshing = shouldRefreshQuotas
+        isUsageRefreshing = true
         errorMessage = nil
 
         Task { [weak self] in
@@ -261,10 +268,13 @@ final class TokenUsageMonitor: ObservableObject {
 
             guard let self else { return }
             isRefreshing = false
+            isQuotaRefreshing = false
+            isUsageRefreshing = false
 
             switch result {
             case .success(let nextSnapshot):
                 snapshot = nextSnapshot
+                lastUsageRefresh = Date()
                 if shouldSync, nextSnapshot.source == .embeddedCollector, nextSnapshot.antigravitySynced {
                     lastAntigravitySync = Date()
                 }
@@ -407,8 +417,8 @@ enum TokenUsageCollector {
         cachedQuotas: [ProviderQuotaUsage] = [],
         cachedQuotaSource: TokenUsageSnapshot.QuotaSource? = nil
     ) async throws -> TokenUsageSnapshot {
-        // 并行任务 1：从内置统计引擎 / 本地日志拉取 Token 使用量与同步记录
-        async let snapshotTask = Task.detached(priority: .userInitiated) { () -> TokenUsageSnapshot in
+        // 并行任务 1A：从内置统计引擎 / 本地日志拉取 Token 使用量
+        async let graphTask = Task.detached(priority: .userInitiated) { () -> TokenUsageSnapshot in
             var snapshot: TokenUsageSnapshot
             if let executable = locateEmbeddedUsageCollector() {
                 do {
@@ -420,15 +430,12 @@ enum TokenUsageCollector {
                     let data = try run(
                         executable,
                         arguments: ["graph", "--since", start, "--no-spinner"],
-                        timeout: 15
+                        timeout: 35
                     )
                     snapshot = try parseUsageGraph(data)
                     snapshot.source = .embeddedCollector
                     snapshot.antigravitySynced = antigravitySync.synced
                     snapshot.note = antigravitySync.note
-
-                    let localSnapshot = collectLocalAntigravity()
-                    mergeAntigravityDataIfNeeded(into: &snapshot, from: localSnapshot)
                 } catch {
                     snapshot = collectLocalLogs()
                     snapshot.note = "内置统计引擎暂时不可用，已改用本地日志统计"
@@ -438,6 +445,11 @@ enum TokenUsageCollector {
                 snapshot.note = "未找到内置统计引擎，已改用本地日志统计"
             }
             return snapshot
+        }.value
+
+        // 并行任务 1B：并发扫描原生 Antigravity 与 Agy CLI 会话日志
+        async let localAntigravityTask = Task.detached(priority: .userInitiated) { () -> TokenUsageSnapshot in
+            collectLocalAntigravity()
         }.value
 
         // 并行任务 2：从 TokenTracker 后端异步拉取实时额度
@@ -454,7 +466,10 @@ enum TokenUsageCollector {
             }
         }.value
 
-        var finalSnapshot = await snapshotTask
+        var finalSnapshot = await graphTask
+        let localSnapshot = await localAntigravityTask
+        mergeAntigravityDataIfNeeded(into: &finalSnapshot, from: localSnapshot)
+
         let (fetchedQuotas, fetchedSource) = await quotasTask
 
         if let fetchedQuotas, !fetchedQuotas.isEmpty, let fetchedSource {
@@ -475,19 +490,82 @@ enum TokenUsageCollector {
         return finalSnapshot
     }
 
-    /// 确保在内置聚合结果与本地 Antigravity 缓存之间取并集，防止任何新导出的 Token 遗漏
+    /// 精准估算单个 Agent 的预估费用（按输入、输出、缓存读取、思考推理细分）
+    private static func estimateAgentCost(_ agent: AgentTokenUsage) -> Double {
+        var totalCost: Double = 0
+        let agentKey = agent.agent.lowercased()
+        let isAntigravityFamily = agentKey == "antigravity" || agentKey == "agy-cli" || agentKey == "gemini"
+
+        for model in agent.models {
+            let tokens = model.tokens
+            let name = model.name.lowercased()
+            let million: Double = 1_000_000
+
+            let inputRate: Double
+            let outputRate: Double
+            let cacheRate: Double
+
+            if isAntigravityFamily {
+                if name.contains("pro") {
+                    (inputRate, outputRate, cacheRate) = (1.25, 5.00, 0.3125)
+                } else if name.contains("opus") {
+                    (inputRate, outputRate, cacheRate) = (15.00, 75.00, 1.50)
+                } else if name.contains("sonnet") {
+                    (inputRate, outputRate, cacheRate) = (3.00, 15.00, 0.30)
+                } else if name.contains("haiku") {
+                    (inputRate, outputRate, cacheRate) = (0.80, 4.00, 0.08)
+                } else {
+                    // Gemini Flash (3.8 / 3.7 / 3.0 等)
+                    (inputRate, outputRate, cacheRate) = (0.15, 0.60, 0.0375)
+                }
+            } else if agentKey.contains("claude") {
+                if name.contains("opus") {
+                    (inputRate, outputRate, cacheRate) = (15.00, 75.00, 1.50)
+                } else if name.contains("haiku") {
+                    (inputRate, outputRate, cacheRate) = (0.80, 4.00, 0.08)
+                } else {
+                    (inputRate, outputRate, cacheRate) = (3.00, 15.00, 0.30)
+                }
+            } else {
+                // Codex / OpenAI / Cursor 族
+                if name.contains("gpt-6") || name.contains("gpt-5") {
+                    (inputRate, outputRate, cacheRate) = (2.00, 8.00, 1.00)
+                } else if name.contains("mini") || name.contains("flash") {
+                    (inputRate, outputRate, cacheRate) = (0.15, 0.60, 0.075)
+                } else {
+                    (inputRate, outputRate, cacheRate) = (2.50, 10.00, 1.25)
+                }
+            }
+
+            let inputCost = (Double(tokens.input) / million) * inputRate
+            let outputCost = (Double(tokens.output + tokens.reasoning) / million) * outputRate
+            let cacheCost = (Double(tokens.cacheRead) / million) * cacheRate
+            totalCost += (inputCost + outputCost + cacheCost)
+        }
+        return totalCost
+    }
+
+    /// 校准快照中的 Antigravity 与 Agy CLI 用量。
+    /// 核心逻辑：
+    /// 1. 【今日防堆积校准】：解决无单条时间戳的跨天超长会话在今日同步时把历史几亿 Token 全部算在今日的严重虚高（1.2 亿 -> 真实增量）。
+    /// 2. 【历史日完整保留】：历史天（如 30 天前的 9月20日-24日 等）拥有底层引擎准确记录的丰富历史柱子，
+    ///    绝不能用字段残缺的本地老格式原生日志去覆盖或清零已有历史，保证 30 天图表真实饱满。
     private static func mergeAntigravityDataIfNeeded(
         into snapshot: inout TokenUsageSnapshot,
         from localSnapshot: TokenUsageSnapshot
     ) {
         var daysMap = Dictionary(uniqueKeysWithValues: snapshot.days.map { ($0.dateKey, $0) })
+        let targetAgents = ["antigravity", "agy-cli"]
+        let todayKey = dayKey(for: Date())
 
+        var allKeys = Set(daysMap.keys)
         for localDay in localSnapshot.days {
-            guard let localAntigravity = localDay.agents.first(where: { $0.agent == "antigravity" }),
-                  localAntigravity.tokens.total > 0
-            else { continue }
+            allKeys.insert(localDay.dateKey)
+        }
 
-            let key = localDay.dateKey
+        let localDaysMap = Dictionary(uniqueKeysWithValues: localSnapshot.days.map { ($0.dateKey, $0) })
+
+        for key in allKeys {
             var dayUsage = daysMap[key] ?? DailyTokenUsage(
                 dateKey: key,
                 tokens: TokenBreakdown(),
@@ -495,34 +573,89 @@ enum TokenUsageCollector {
                 estimatedCost: nil
             )
             var agents = dayUsage.agents
+            var dayChanged = false
+            let isToday = (key == todayKey)
 
-            if let index = agents.firstIndex(where: { $0.agent == "antigravity" }) {
-                // 若本地解析出的 Antigravity Token 数量大于现有的，则取大值补全
-                if localAntigravity.tokens.total > agents[index].tokens.total {
-                    let diff = localAntigravity.tokens - agents[index].tokens
-                    agents[index] = localAntigravity
-                    dayUsage = DailyTokenUsage(
-                        dateKey: key,
-                        tokens: dayUsage.tokens + diff,
-                        agents: agents.sorted { $0.tokens.total > $1.tokens.total },
-                        estimatedCost: dayUsage.estimatedCost
-                    )
+            for targetAgent in targetAgents {
+                let localAgent = localDaysMap[key]?.agents.first(where: { $0.agent == targetAgent })
+                let existingIndex = agents.firstIndex(where: { $0.agent == targetAgent })
+
+                if isToday {
+                    // 今日场景：底层引擎极易受到“无时间戳跨天会话在今天活跃被 sync”导致的历史全量归集虚高。
+                    // 本地原生日志拥有今天每一步确切的 created_at 时间戳，能精准切出今日真实增量。
+                    if let localAgent, localAgent.tokens.total > 0 {
+                        if let existingIndex {
+                            // 若已有统计与本地真实增量不一致（通常底层堆积出几千万到上亿），以本地权威真实数据覆盖
+                            if agents[existingIndex].tokens != localAgent.tokens {
+                                agents[existingIndex] = localAgent
+                                dayChanged = true
+                            }
+                        } else {
+                            agents.append(localAgent)
+                            dayChanged = true
+                        }
+                    } else if let existingIndex {
+                        // 今日原生完全无该 Agent 调用，底层却凭空出现，说明是历史回退的幽灵数据，剔除之
+                        agents.remove(at: existingIndex)
+                        dayChanged = true
+                    }
+                } else {
+                    // 历史日场景：保留底层引擎记录的真实历史数据（如 9月20日-24日 的几亿真实调用）。
+                    // 原生老日志缺少 input_tokens/cacheRead 字段，绝不能用残缺数据去缩小或清空已有历史柱子。
+                    if let localAgent, localAgent.tokens.total > 0 {
+                        if let existingIndex {
+                            // 若本地解析出的有效 Token 明显大于已有统计，进行增量补全
+                            if localAgent.tokens.total > agents[existingIndex].tokens.total {
+                                agents[existingIndex] = localAgent
+                                dayChanged = true
+                            }
+                        } else {
+                            // 底层该历史日没有，本地原生有，则补充
+                            agents.append(localAgent)
+                            dayChanged = true
+                        }
+                    }
+                    // 历史天若底层已有，即使本地原生未匹配到，也绝对不删除已有历史数据
                 }
-            } else {
-                // 若原有结果中没有 Antigravity，直接追加合并
-                agents.append(localAntigravity)
+            }
+
+            if dayChanged {
+                // 基于最新 agents 重新精确加总当日总 Token
+                var recalculatedTokens = TokenBreakdown()
+                for ag in agents {
+                    recalculatedTokens = recalculatedTokens + ag.tokens
+                }
+
+                // 重新核算当日预估费用
+                var recomputedCost: Double = 0
+                for ag in agents {
+                    recomputedCost += estimateAgentCost(ag)
+                }
+
                 dayUsage = DailyTokenUsage(
                     dateKey: key,
-                    tokens: dayUsage.tokens + localAntigravity.tokens,
+                    tokens: recalculatedTokens,
                     agents: agents.sorted { $0.tokens.total > $1.tokens.total },
-                    estimatedCost: dayUsage.estimatedCost
+                    estimatedCost: recomputedCost > 0 ? recomputedCost : (recalculatedTokens.total == 0 ? 0 : dayUsage.estimatedCost)
                 )
+                daysMap[key] = dayUsage
             }
-            daysMap[key] = dayUsage
         }
 
-        let sortedKeys = daysMap.keys.sorted()
-        snapshot.days = sortedKeys.compactMap { daysMap[$0] }
+        // 严格保证按照 30 天日期窗口对齐输出，保证柱状图 30 天每一个点位置完全对应
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        var resultDays: [DailyTokenUsage] = []
+        for offset in (-29)...0 {
+            guard let date = calendar.date(byAdding: .day, value: offset, to: today) else { continue }
+            let key = dayKey(for: date)
+            if let usage = daysMap[key] {
+                resultDays.append(usage)
+            } else {
+                resultDays.append(DailyTokenUsage(dateKey: key, tokens: TokenBreakdown(), agents: [], estimatedCost: 0))
+            }
+        }
+        snapshot.days = resultDays
     }
 
     static func parseUsageGraph(_ data: Data) throws -> TokenUsageSnapshot {
@@ -840,6 +973,12 @@ enum TokenUsageCollector {
             into: &accumulators
         )
 
+        // 优先扫描原生的 Antigravity 与 Agy CLI 会话日志
+        parseNativeAntigravityAndAgy(
+            earliestDate: earliestDate,
+            into: &accumulators
+        )
+
         parseAntigravityCache(
             root: prepareUsageCollectorStorage().appendingPathComponent("antigravity-cache/sessions"),
             earliestDate: earliestDate,
@@ -852,9 +991,9 @@ enum TokenUsageCollector {
     private static func collectLocalAntigravity() -> TokenUsageSnapshot {
         var accumulators: [String: DayAccumulator] = [:]
         let earliestDate = Calendar.current.date(byAdding: .day, value: -31, to: Date()) ?? Date()
-        let collectorConfig = prepareUsageCollectorStorage()
-        parseAntigravityCache(
-            root: collectorConfig.appendingPathComponent("antigravity-cache/sessions"),
+
+        // 仅扫描原生的 Antigravity 与 Agy CLI 会话日志（带有绝对权威的精确 step created_at 时间戳）
+        parseNativeAntigravityAndAgy(
             earliestDate: earliestDate,
             into: &accumulators
         )
@@ -1057,6 +1196,140 @@ enum TokenUsageCollector {
                 record(tokens, agent: "antigravity", model: model, date: date, into: &accumulators)
             }
         }
+    }
+
+    /// 直接解析本机 ~/.gemini/ 目录下 Antigravity IDE 和 Agy CLI 原生会话日志
+    private static func parseNativeAntigravityAndAgy(
+        earliestDate: Date,
+        into accumulators: inout [String: DayAccumulator]
+    ) {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let geminiDir = home.appendingPathComponent(".gemini", isDirectory: true)
+
+        let targets: [(agent: String, dir: URL)] = [
+            ("antigravity", geminiDir.appendingPathComponent("antigravity/brain", isDirectory: true)),
+            ("antigravity", geminiDir.appendingPathComponent("antigravity-ide/brain", isDirectory: true)),
+            ("agy-cli", geminiDir.appendingPathComponent("antigravity-cli/brain", isDirectory: true)),
+        ]
+
+        let fileManager = FileManager.default
+
+        for target in targets {
+            guard fileManager.fileExists(atPath: target.dir.path) else { continue }
+            guard let sessionDirs = try? fileManager.contentsOfDirectory(
+                at: target.dir,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) else { continue }
+
+            for sessionDir in sessionDirs {
+                let transcriptFile = sessionDir
+                    .appendingPathComponent(".system_generated", isDirectory: true)
+                    .appendingPathComponent("logs", isDirectory: true)
+                    .appendingPathComponent("transcript.jsonl", isDirectory: false)
+
+                guard let values = try? transcriptFile.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey]),
+                      values.isRegularFile == true,
+                      (values.contentModificationDate ?? .distantPast) >= earliestDate
+                else { continue }
+
+                guard let content = try? String(contentsOf: transcriptFile, encoding: .utf8) else { continue }
+                let lines = content.split(whereSeparator: \.isNewline)
+
+                var currentModel = "gemini-3.8-flash"
+                for line in lines {
+                    if line.contains("Model Selection") {
+                        if let match = extractModelSelection(from: String(line)) {
+                            currentModel = normalizeAntigravityModel(match)
+                        }
+                    }
+
+                    guard line.contains("\"PLANNER_RESPONSE\""),
+                          let data = String(line).data(using: .utf8),
+                          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          object["type"] as? String == "PLANNER_RESPONSE"
+                    else { continue }
+
+                    guard let timestamp = object["created_at"] as? String,
+                          let date = parseISODate(timestamp),
+                          date >= earliestDate
+                    else { continue }
+
+                    let inputTokens = number(object["input_tokens"])
+                    let outputTokens = number(object["output_tokens"])
+                    let cacheRead = number(object["cache_read_tokens"])
+                    let cacheWrite = number(object["cache_write_tokens"])
+
+                    let thinking = object["thinking"] as? String ?? ""
+                    let reasoningTokens = number(object["reasoning_tokens"]) > 0
+                        ? number(object["reasoning_tokens"])
+                        : Int64(thinking.count / 3)
+
+                    var tokens = TokenBreakdown(
+                        input: inputTokens,
+                        output: outputTokens,
+                        cacheRead: cacheRead,
+                        cacheWrite: cacheWrite,
+                        reasoning: reasoningTokens
+                    )
+
+                    if inputTokens == 0 && outputTokens == 0 && cacheRead == 0 {
+                        // 针对旧格式未记录明确 token 数时的字符估算兜底
+                        let contentStr = object["content"] as? String ?? ""
+                        let toolCalls = object["tool_calls"]
+                        let toolCallsCount: Int
+                        if let toolCalls = toolCalls as? [Any] {
+                            toolCallsCount = toolCalls.count * 150
+                        } else {
+                            toolCallsCount = 0
+                        }
+                        let estOutput = Int64((contentStr.count + toolCallsCount) / 3)
+                        tokens = TokenBreakdown(
+                            input: 1000,
+                            output: estOutput,
+                            cacheRead: 0,
+                            cacheWrite: 0,
+                            reasoning: reasoningTokens
+                        )
+                    }
+
+                    if tokens.total > 0 {
+                        record(tokens, agent: target.agent, model: currentModel, date: date, into: &accumulators)
+                    }
+                }
+            }
+        }
+    }
+
+    /// 从日志上下文字符串中提取切换的模型名
+    private static func extractModelSelection(from text: String) -> String? {
+        guard text.contains("<USER_SETTINGS_CHANGE>") else { return nil }
+        guard let range = text.range(of: "`Model Selection` from ") else { return nil }
+        let afterFrom = text[range.upperBound...]
+        guard let toRange = afterFrom.range(of: " to ") else { return nil }
+        let target = afterFrom[toRange.upperBound...]
+        let raw = target.prefix { $0 != "." && $0 != "`" && $0 != "\n" }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty && trimmed.count <= 50 else { return nil }
+        let disallowedCharacters = CharacterSet(charactersIn: "{}[]<>;\\\"")
+        guard trimmed.rangeOfCharacter(from: disallowedCharacters) == nil else { return nil }
+        return trimmed
+    }
+
+    /// 归一化 Antigravity / Agy CLI 的模型标识
+    private static func normalizeAntigravityModel(_ model: String?) -> String {
+        guard let model, !model.isEmpty else { return "gemini-3.8-flash" }
+        let lower = model.lowercased()
+        if lower.contains("3.8") && lower.contains("flash") { return "gemini-3.8-flash" }
+        if lower.contains("3.7") && lower.contains("flash") { return "gemini-3.7-flash" }
+        if lower.contains("3.6") && lower.contains("flash") { return "gemini-3.6-flash" }
+        if lower.contains("3.1") && lower.contains("pro") { return "gemini-3.1-pro" }
+        if lower.contains("3") && lower.contains("flash") { return "gemini-3-flash" }
+        if lower.contains("sonnet") { return "claude-sonnet-4-6" }
+        if lower.contains("opus") { return "claude-opus-4-6" }
+        if lower.contains("haiku") { return "claude-haiku-4-5" }
+        if lower.contains("gemini") { return "gemini-3.8-flash" }
+        return "gemini-3.8-flash"
     }
 
     private static func breakdown(fromCodexUsage usage: [String: Any]?) -> TokenBreakdown? {
@@ -1357,12 +1630,18 @@ extension Int64 {
         case 1_000_000_000...:
             return String(format: value >= 10_000_000_000 ? "%.0fB" : "%.1fB", value / 1_000_000_000)
         case 1_000_000...:
-            return String(format: value >= 100_000_000 ? "%.0fM" : "%.1fM", value / 1_000_000)
+            return String(format: "%.1fM", value / 1_000_000)
         case 1_000...:
             return String(format: value >= 100_000 ? "%.0fK" : "%.1fK", value / 1_000)
         default:
             return "\(self)"
         }
+    }
+
+    var formattedWithSeparators: String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter.string(from: NSNumber(value: self)) ?? "\(self)"
     }
 }
 

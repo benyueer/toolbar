@@ -12,11 +12,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var tokenObservation: AnyCancellable?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        guard isSingleInstance() else {
+            // 已有其他实例正在运行，自动退出避免重复常驻菜单栏
+            NSApp.terminate(nil)
+            return
+        }
+
         NSApp.setActivationPolicy(.accessory)
         configurePopover()
         configureStatusItem()
         observeMetrics()
         updateStatusItem()
+    }
+
+    /// 校验是否为唯一运行中的实例
+    private func isSingleInstance() -> Bool {
+        guard let bundleId = Bundle.main.bundleIdentifier else { return true }
+        let currentPid = ProcessInfo.processInfo.processIdentifier
+        let runningApps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
+        return !runningApps.contains { $0.processIdentifier != currentPid }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -152,7 +166,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             NSApp.activate()
             popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
-            popover.contentViewController?.view.window?.makeKey()
+            if let window = popover.contentViewController?.view.window {
+                window.isOpaque = false
+                window.backgroundColor = .clear
+                window.contentView?.wantsLayer = true
+                window.contentView?.layer?.backgroundColor = NSColor.clear.cgColor
+                popover.contentViewController?.view.wantsLayer = true
+                popover.contentViewController?.view.layer?.backgroundColor = NSColor.clear.cgColor
+                window.makeKey()
+            }
         }
     }
 }

@@ -3,7 +3,7 @@ import SwiftUI
 
 @MainActor
 struct SystemDetailsView: View {
-    @ObservedObject var metrics: SystemMetrics
+    let metrics: SystemMetrics
     @ObservedObject var tokenUsage: TokenUsageMonitor
     @State private var selectedSection = DetailSection.tokens
 
@@ -30,15 +30,11 @@ struct SystemDetailsView: View {
         .frame(width: 420, height: 680)
         .background(
             ZStack {
-                Color(nsColor: .windowBackgroundColor)
-                    .opacity(0.85)
-
                 LinearGradient(
                     colors: [
-                        Color.black.opacity(0.12),
-                        Color.indigo.opacity(0.06),
-                        Color.purple.opacity(0.04),
-                        Color.black.opacity(0.08)
+                        Color.white.opacity(0.035),
+                        Color.indigo.opacity(0.018),
+                        Color.black.opacity(0.045)
                     ],
                     startPoint: .top,
                     endPoint: .bottom
@@ -48,15 +44,7 @@ struct SystemDetailsView: View {
     }
 
     private var systemDashboard: some View {
-        ScrollView(.vertical, showsIndicators: false) {
-            VStack(spacing: 16) {
-                gauges
-                history
-                networkHistory
-                detailRows
-            }
-            .padding(18)
-        }
+        SystemDashboardView(metrics: metrics)
     }
 
     private var header: some View {
@@ -94,11 +82,12 @@ struct SystemDetailsView: View {
             .controlSize(.small)
             .frame(width: 158)
 
+            let isRefreshing = (selectedSection == .tokens ? tokenUsage.isRefreshing : false)
             Button {
                 metrics.refresh()
-                tokenUsage.refresh(forceAntigravitySync: true, forceQuotaRefresh: true)
+                tokenUsage.refresh(forceAntigravitySync: false, forceQuotaRefresh: true)
             } label: {
-                if tokenUsage.isRefreshing && selectedSection == .tokens {
+                if isRefreshing {
                     ProgressView()
                         .controlSize(.small)
                 } else {
@@ -106,10 +95,44 @@ struct SystemDetailsView: View {
                 }
             }
             .buttonStyle(.borderless)
-            .help("立即刷新")
+            .disabled(isRefreshing)
+            .help(isRefreshing ? "正在刷新用量与额度…" : (selectedSection == .tokens ? "立即刷新用量与额度" : "立即刷新系统指标"))
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+
+    private var footer: some View {
+        HStack {
+            if selectedSection == .system {
+                SystemUptimeLabel(metrics: metrics)
+            }
+
+            Spacer()
+
+            Button("退出") {
+                NSApplication.shared.terminate(nil)
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 11)
+    }
+}
+
+private struct SystemDashboardView: View {
+    @ObservedObject var metrics: SystemMetrics
+
+    var body: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(spacing: 16) {
+                gauges
+                history
+                networkHistory
+                detailRows
+            }
+            .padding(18)
+        }
     }
 
     private var gauges: some View {
@@ -229,24 +252,15 @@ struct SystemDetailsView: View {
             1_000
         ) * 1.1
     }
+}
 
-    private var footer: some View {
-        HStack {
-            if selectedSection == .system {
-                Label("已运行 \(metrics.uptimeText)", systemImage: "clock")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
+private struct SystemUptimeLabel: View {
+    @ObservedObject var metrics: SystemMetrics
 
-            Spacer()
-
-            Button("退出") {
-                NSApplication.shared.terminate(nil)
-            }
-            .buttonStyle(.borderless)
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 11)
+    var body: some View {
+        Label("已运行 \(metrics.uptimeText)", systemImage: "clock")
+            .font(.caption)
+            .foregroundStyle(.secondary)
     }
 }
 
@@ -278,6 +292,7 @@ private struct TokenDashboardView: View {
     @ObservedObject var monitor: TokenUsageMonitor
     @State private var period = TokenPeriod.week
     @State private var quotaLabelWidth: CGFloat = 0
+    @State private var currentTime = Date()
 
     private var snapshot: TokenUsageSnapshot { monitor.snapshot }
     private var selectedTokens: TokenBreakdown { snapshot.totals(last: period.rawValue) }
@@ -317,18 +332,34 @@ private struct TokenDashboardView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 14)
         }
+        .onReceive(Timer.publish(every: 10, on: .main, in: .common).autoconnect()) { date in
+            currentTime = date
+        }
+        .onReceive(monitor.$snapshot) { _ in
+            currentTime = Date()
+        }
     }
 
     private var summaryCards: some View {
         HStack(spacing: 7) {
-            TokenStatCard(title: "今日 Token", value: snapshot.today.total.tokenText, detail: "tokens")
+            TokenStatCard(
+                title: "今日 Token",
+                value: snapshot.today.total.tokenText,
+                detail: "tokens",
+                tooltip: "今日总用量：\(snapshot.today.total.formattedWithSeparators) tokens"
+            )
             TokenStatCard(
                 title: "预估花费",
                 value: snapshot.todayEstimatedCost?.estimatedCostText ?? "$0.00",
                 detail: "今日预估",
                 valueColor: .green
             )
-            TokenStatCard(title: "30 天", value: snapshot.last30Days.total.tokenText, detail: "累计")
+            TokenStatCard(
+                title: "30 天",
+                value: snapshot.last30Days.total.tokenText,
+                detail: "累计",
+                tooltip: "30天累计用量：\(snapshot.last30Days.total.formattedWithSeparators) tokens"
+            )
             TokenStatCard(
                 title: "Agents",
                 value: "\(snapshot.agents(last: 30).count)",
@@ -338,9 +369,23 @@ private struct TokenDashboardView: View {
     }
 
     private var periodControl: some View {
-        HStack(spacing: 3) {
+        HStack(spacing: 6) {
             Text("Agent 用量")
                 .font(.caption.weight(.semibold))
+
+            if monitor.isUsageRefreshing {
+                HStack(spacing: 4) {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text("正在刷新…")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                }
+            } else if let lastRefresh = monitor.lastUsageRefresh {
+                Text("更新于 \(lastRefresh.formatted(date: .omitted, time: .standard))")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+            }
 
             Spacer()
 
@@ -367,9 +412,13 @@ private struct TokenDashboardView: View {
 
     private var accountQuotaSection: some View {
         VStack(alignment: .leading, spacing: 7) {
-            HStack {
+            HStack(spacing: 6) {
                 Text("账户额度")
                     .font(.caption.weight(.semibold))
+                if monitor.isQuotaRefreshing {
+                    ProgressView()
+                        .controlSize(.mini)
+                }
                 Spacer()
                 Text("已用 · 自动重置")
                     .font(.caption2)
@@ -381,7 +430,8 @@ private struct TokenDashboardView: View {
                     ProviderQuotaGroupView(
                         provider: provider,
                         labelColumnWidth: quotaLabelWidth,
-                        color: accountColor(provider.canonicalAgent, index: index)
+                        color: accountColor(provider.canonicalAgent, index: index),
+                        currentTime: currentTime
                     )
                     .padding(.vertical, 10)
 
@@ -504,6 +554,7 @@ private struct TokenDashboardView: View {
         case "claude": "Claude Code"
         case "gemini": "Gemini CLI"
         case "antigravity": "Antigravity"
+        case "agy-cli", "antigravity-cli", "agy": "Agy CLI"
         case "opencode": "OpenCode"
         case "cursor": "Cursor"
         case "copilot": "GitHub Copilot"
@@ -556,6 +607,7 @@ private struct TokenDashboardView: View {
         case "codex": .green
         case "claude": .orange
         case "antigravity": .indigo
+        case "agy-cli", "antigravity-cli", "agy": .cyan
         case "gemini": .blue
         case "opencode": .mint
         case "cursor": .purple
@@ -568,6 +620,7 @@ private struct TokenDashboardView: View {
         case "codex": .green
         case "claude": .orange
         case "antigravity": .cyan
+        case "agy-cli", "antigravity-cli", "agy": .teal
         case "gemini": .blue
         case "opencode": .purple
         case "copilot": .indigo
@@ -581,6 +634,7 @@ private struct TokenStatCard: View {
     let value: String
     let detail: String
     var valueColor: Color = .primary
+    var tooltip: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -602,6 +656,7 @@ private struct TokenStatCard: View {
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .tokenCard()
+        .help(tooltip ?? "\(title): \(value)")
         .accessibilityElement(children: .combine)
     }
 }
@@ -737,6 +792,7 @@ private struct TokenBreakdownPill: View {
         .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(color.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
+        .help("\(title)：\(value.formattedWithSeparators) tokens")
         .accessibilityElement(children: .combine)
     }
 }
@@ -745,6 +801,7 @@ private struct ProviderQuotaGroupView: View {
     let provider: ProviderQuotaUsage
     let labelColumnWidth: CGFloat
     let color: Color
+    let currentTime: Date
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -764,7 +821,8 @@ private struct ProviderQuotaGroupView: View {
                     ForEach(usageWindows) { window in
                         AccountQuotaRow(
                             window: window,
-                            labelColumnWidth: labelColumnWidth
+                            labelColumnWidth: labelColumnWidth,
+                            currentTime: currentTime
                         )
                     }
                 }
@@ -780,7 +838,8 @@ private struct ProviderQuotaGroupView: View {
                     ForEach(resetWindows) { window in
                         AccountQuotaRow(
                             window: window,
-                            labelColumnWidth: labelColumnWidth
+                            labelColumnWidth: labelColumnWidth,
+                            currentTime: currentTime
                         )
                     }
                 }
@@ -803,6 +862,7 @@ private struct ProviderQuotaGroupView: View {
 private struct AccountQuotaRow: View {
     let window: QuotaWindowUsage
     let labelColumnWidth: CGFloat
+    let currentTime: Date
 
     private var clampedPercent: Double {
         min(max(window.usedPercent, 0), 100)
@@ -810,7 +870,7 @@ private struct AccountQuotaRow: View {
 
     private var resetText: String {
         guard let reset = window.resetsAt else { return "—" }
-        let seconds = max(0, reset.timeIntervalSinceNow)
+        let seconds = max(0, reset.timeIntervalSince(currentTime))
         if seconds >= 24 * 60 * 60 { return "\(Int(seconds / (24 * 60 * 60)))d" }
         if seconds >= 60 * 60 { return "\(Int(seconds / (60 * 60)))h" }
         return "\(max(1, Int(seconds / 60)))m"
@@ -943,6 +1003,15 @@ private struct AgentUsageGroupView: View {
         return min(max(Double(agent.tokens.total) / Double(total) * 100, 0), 100)
     }
 
+    private var detailedHelpText: String {
+        let totalFormatted = agent.tokens.total.formattedWithSeparators
+        let inFormatted = agent.tokens.input.formattedWithSeparators
+        let outFormatted = agent.tokens.output.formattedWithSeparators
+        let cacheFormatted = (agent.tokens.cacheRead + agent.tokens.cacheWrite).formattedWithSeparators
+        let reasoningFormatted = agent.tokens.reasoning.formattedWithSeparators
+        return "\(agent.displayName)：\(totalFormatted) tokens (输入: \(inFormatted) · 输出: \(outFormatted) · 缓存: \(cacheFormatted) · 推理: \(reasoningFormatted)) · 占所选时段 \(Int(sharePercent.rounded()))%"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Button {
@@ -997,6 +1066,7 @@ private struct AgentUsageGroupView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .help(detailedHelpText)
             .accessibilityLabel(
                 "\(agent.displayName)，\(agent.tokens.total.tokenText) Token，占所选时段 \(Int(sharePercent.rounded()))%"
             )
@@ -1037,6 +1107,15 @@ private struct ModelUsageRow: View {
         return min(max(Double(model.tokens.total) / Double(total) * 100, 0), 100)
     }
 
+    private var detailedHelpText: String {
+        let totalFormatted = model.tokens.total.formattedWithSeparators
+        let inFormatted = model.tokens.input.formattedWithSeparators
+        let outFormatted = model.tokens.output.formattedWithSeparators
+        let cacheFormatted = (model.tokens.cacheRead + model.tokens.cacheWrite).formattedWithSeparators
+        let reasoningFormatted = model.tokens.reasoning.formattedWithSeparators
+        return "\(model.name)：\(totalFormatted) tokens (输入: \(inFormatted) · 输出: \(outFormatted) · 缓存: \(cacheFormatted) · 推理: \(reasoningFormatted)) · 占该 Agent \(Int(sharePercent.rounded()))%"
+    }
+
     var body: some View {
         HStack(spacing: 5) {
             Text(model.name)
@@ -1060,7 +1139,7 @@ private struct ModelUsageRow: View {
                 .foregroundStyle(.tertiary)
                 .frame(width: 34, alignment: .trailing)
         }
-        .help("\(model.name)：\(model.tokens.total.tokenText) Token，占该 Agent \(Int(sharePercent.rounded()))%")
+        .help(detailedHelpText)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(
             "\(model.name)，\(model.tokens.total.tokenText) Token，占该 Agent \(Int(sharePercent.rounded()))%"
@@ -1080,7 +1159,15 @@ private final class AgentLogoStore {
         if let cached = cached[key] { return cached }
         if unavailable.contains(key) { return nil }
 
-        if let image = installedApplicationIcon(for: key) ?? bundledBrandIcon(for: key) {
+        let image: NSImage?
+        if key == "antigravity" || key == "agy-cli" || key == "agy" || key == "antigravity-cli" {
+            // Antigravity 和 Agy CLI 均使用内置官方品牌图标
+            image = bundledBrandIcon(for: "antigravity") ?? installedApplicationIcon(for: "antigravity")
+        } else {
+            image = installedApplicationIcon(for: key) ?? bundledBrandIcon(for: key)
+        }
+
+        if let image {
             cached[key] = image
             return image
         }
@@ -1122,27 +1209,29 @@ private final class AgentLogoStore {
 
     private func bundledBrandIcon(for agent: String) -> NSImage? {
         let resourceName: String
+        let resourceExtension: String
         switch agent {
-        case "claude": resourceName = "claude"
-        case "gemini", "antigravity": resourceName = "googlegemini"
-        case "cursor": resourceName = "cursor"
-        case "copilot": resourceName = "githubcopilot"
-        case "opencode": resourceName = "opencode"
-        case "kimi": resourceName = "moonshotai"
-        case "zed": resourceName = "zedindustries"
+        case "claude": resourceName = "claude"; resourceExtension = "svg"
+        case "gemini": resourceName = "googlegemini"; resourceExtension = "svg"
+        case "antigravity": resourceName = "antigravity"; resourceExtension = "icns"
+        case "cursor": resourceName = "cursor"; resourceExtension = "svg"
+        case "copilot": resourceName = "githubcopilot"; resourceExtension = "svg"
+        case "opencode": resourceName = "opencode"; resourceExtension = "svg"
+        case "kimi": resourceName = "moonshotai"; resourceExtension = "svg"
+        case "zed": resourceName = "zedindustries"; resourceExtension = "svg"
         default: return nil
         }
 
         guard
             let url = Bundle.main.url(
                 forResource: resourceName,
-                withExtension: "svg",
+                withExtension: resourceExtension,
                 subdirectory: "AgentLogos"
             ),
             let image = NSImage(contentsOf: url)
         else { return nil }
 
-        image.isTemplate = agent != "opencode"
+        image.isTemplate = resourceExtension == "svg" && agent != "opencode"
         return image
     }
 }
@@ -1181,6 +1270,7 @@ private struct AgentBrandLogo: View {
         case "codex": "chevron.left.forwardslash.chevron.right"
         case "claude": "c.circle.fill"
         case "antigravity": "sparkles"
+        case "agy-cli", "antigravity-cli", "agy": "terminal.fill"
         case "gemini": "diamond.fill"
         case "opencode": "terminal.fill"
         case "cursor": "cursorarrow.rays"

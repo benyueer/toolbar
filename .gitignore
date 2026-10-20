@@ -9,3 +9,6 @@ build/
 _edit_agent_view.py
 serve_file.js
 ToolbarMonitor/Resources/UsageCollectorBackend/usage-collector
+dist/
+
+Vendor/TokscaleSource/target/

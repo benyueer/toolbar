@@ -36,14 +36,16 @@ final class SystemMetrics: ObservableObject {
     private let updateInterval: TimeInterval = 1
     private let historyLimit = 180
 
-    @Published private(set) var cpu = CPUUsage()
-    @Published private(set) var memory = MemoryUsage()
-    @Published private(set) var network = NetworkUsage()
-    @Published private(set) var cpuHistory = Array(repeating: 0.0, count: 180)
-    @Published private(set) var memoryHistory = Array(repeating: 0.0, count: 180)
-    @Published private(set) var downloadHistory = Array(repeating: 0.0, count: 180)
-    @Published private(set) var uploadHistory = Array(repeating: 0.0, count: 180)
-    @Published private(set) var lastUpdated = Date()
+    // Publish a complete sample once from refresh() instead of invalidating SwiftUI
+    // separately for every metric and history array.
+    private(set) var cpu = CPUUsage()
+    private(set) var memory = MemoryUsage()
+    private(set) var network = NetworkUsage()
+    private(set) var cpuHistory = Array(repeating: 0.0, count: 180)
+    private(set) var memoryHistory = Array(repeating: 0.0, count: 180)
+    private(set) var downloadHistory = Array(repeating: 0.0, count: 180)
+    private(set) var uploadHistory = Array(repeating: 0.0, count: 180)
+    private(set) var lastUpdated = Date()
 
     private var previousCPUTicks: [UInt64]?
     private var previousNetworkCounters: [String: NetworkCounters]?
@@ -52,20 +54,23 @@ final class SystemMetrics: ObservableObject {
 
     init() {
         refresh()
+        // Keep the timer out of event-tracking mode so scrolling takes priority.
         timer = Timer.scheduledTimer(withTimeInterval: updateInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.refresh()
             }
         }
-        if let timer {
-            RunLoop.main.add(timer, forMode: .common)
-        }
     }
 
     func refresh() {
-        cpu = readCPUUsage()
-        memory = readMemoryUsage()
-        network = readNetworkUsage(at: ProcessInfo.processInfo.systemUptime)
+        let nextCPU = readCPUUsage()
+        let nextMemory = readMemoryUsage()
+        let nextNetwork = readNetworkUsage(at: ProcessInfo.processInfo.systemUptime)
+
+        objectWillChange.send()
+        cpu = nextCPU
+        memory = nextMemory
+        network = nextNetwork
         append(cpu.total, to: &cpuHistory)
         append(memory.utilization, to: &memoryHistory)
         append(network.downloadBytesPerSecond, to: &downloadHistory)
@@ -160,6 +165,7 @@ final class SystemMetrics: ObservableObject {
             }
 
             let name = String(cString: interface.ifa_name)
+            guard name == "en0" else { continue }
             let data = rawData.assumingMemoryBound(to: if_data.self).pointee
             counters[name] = NetworkCounters(
                 receivedBytes: UInt64(data.ifi_ibytes),
