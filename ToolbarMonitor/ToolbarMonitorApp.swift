@@ -3,13 +3,20 @@ import Combine
 import SwiftUI
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class PopoverVisibility: ObservableObject {
+    @Published var isShown = false
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let metrics = SystemMetrics()
     private let tokenUsage = TokenUsageMonitor()
     private let popover = NSPopover()
+    private let popoverVisibility = PopoverVisibility()
     private var statusItem: NSStatusItem?
     private var metricsObservation: AnyCancellable?
     private var tokenObservation: AnyCancellable?
+    private var lastRenderedState: StatusDisplayState?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard isSingleInstance() else {
@@ -42,10 +49,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func configurePopover() {
         popover.behavior = .transient
         popover.animates = true
+        popover.delegate = self
         popover.contentSize = NSSize(width: 420, height: 680)
         popover.contentViewController = NSHostingController(
-            rootView: SystemDetailsView(metrics: metrics, tokenUsage: tokenUsage)
+            rootView: SystemDetailsView(
+                metrics: metrics,
+                tokenUsage: tokenUsage,
+                popoverVisibility: popoverVisibility
+            )
         )
+    }
+
+    // MARK: - NSPopoverDelegate
+
+    func popoverWillShow(_ notification: Notification) {
+        popoverVisibility.isShown = true
+        metrics.refresh()
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        popoverVisibility.isShown = false
     }
 
     private func configureStatusItem() {
@@ -74,36 +97,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private struct StatusDisplayState: Equatable {
+        let cpu: String
+        let mem: String
+        let up: String
+        let down: String
+        let token: String
+        let cost: String
+    }
+
     private func updateStatusItem() {
         guard let button = statusItem?.button else { return }
 
-        let image = makeStatusImage()
+        let isInitialLoading = tokenUsage.isRefreshing && tokenUsage.snapshot.days.isEmpty
+        let tokenText = isInitialLoading ? "···" : tokenUsage.snapshot.today.total.tokenText
+        let costText = isInitialLoading
+            ? "···"
+            : tokenUsage.snapshot.todayEstimatedCost?.estimatedCostText ?? "—"
+        let cpuText = metrics.cpu.total.percentText
+        let memText = metrics.memory.utilization.percentText
+        let upText = metrics.network.uploadBytesPerSecond.speedText
+        let downText = metrics.network.downloadBytesPerSecond.speedText
+
+        let currentState = StatusDisplayState(
+            cpu: cpuText,
+            mem: memText,
+            up: upText,
+            down: downText,
+            token: tokenText,
+            cost: costText
+        )
+
+        // 仅在文本内容有变动时才重新绘制图片并更新菜单栏，避免每秒无意义重绘
+        guard currentState != lastRenderedState else { return }
+        lastRenderedState = currentState
+
+        let image = makeStatusImage(
+            cpuText: cpuText,
+            memText: memText,
+            upText: upText,
+            downText: downText,
+            tokenText: tokenText,
+            costText: costText
+        )
         button.image = image
         statusItem?.length = image.size.width + 2
         let estimatedCostLabel = tokenUsage.snapshot.todayEstimatedCost.map {
             "，预估花费 \($0.estimatedCostText)"
         } ?? ""
         button.setAccessibilityLabel(
-            "CPU \(metrics.cpu.total.percentText)，上传 \(metrics.network.uploadBytesPerSecond.speedText)，" +
-            "内存 \(metrics.memory.utilization.percentText)，下载 \(metrics.network.downloadBytesPerSecond.speedText)，" +
-            "今日 Token \(tokenUsage.snapshot.today.total.tokenText)\(estimatedCostLabel)"
+            "CPU \(cpuText)，上传 \(upText)，" +
+            "内存 \(memText)，下载 \(downText)，" +
+            "今日 Token \(tokenText)\(estimatedCostLabel)"
         )
     }
 
-    private func makeStatusImage() -> NSImage {
-        let isInitialLoading = tokenUsage.isRefreshing && tokenUsage.snapshot.days.isEmpty
-        let tokenText = isInitialLoading ? "···" : tokenUsage.snapshot.today.total.tokenText
-        let costText = isInitialLoading
-            ? "···"
-            : tokenUsage.snapshot.todayEstimatedCost?.estimatedCostText ?? "—"
-
+    private func makeStatusImage(
+        cpuText: String,
+        memText: String,
+        upText: String,
+        downText: String,
+        tokenText: String,
+        costText: String
+    ) -> NSImage {
         let tokenTextSize = (tokenText as NSString).size(withAttributes: StatusDrawingStyles.tokenAttributes)
         let costTextSize = (costText as NSString).size(withAttributes: StatusDrawingStyles.costAttributes)
         let tokenWidth = max(35, ceil(max(tokenTextSize.width, costTextSize.width)) + 4)
         let totalWidth: CGFloat = 100 + tokenWidth
         let size = NSSize(width: totalWidth, height: 22)
 
-        let image = NSImage(size: size, flipped: true) { [metrics, tokenText, costText] _ in
+        let image = NSImage(size: size, flipped: true) { _ in
             let rowHeight = size.height / 2
             let percentageWidth: CGFloat = 25
             let arrowX: CGFloat = 27
@@ -113,7 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let dividerX: CGFloat = 95
             let tokenX: CGFloat = 100
 
-            (metrics.cpu.total.percentText as NSString).draw(
+            (cpuText as NSString).draw(
                 in: NSRect(x: 0, y: 0, width: percentageWidth, height: rowHeight),
                 withAttributes: StatusDrawingStyles.attributes
             )
@@ -121,11 +184,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 in: NSRect(x: arrowX, y: 0, width: arrowWidth, height: rowHeight),
                 withAttributes: StatusDrawingStyles.attributes
             )
-            (metrics.network.uploadBytesPerSecond.speedText as NSString).draw(
+            (upText as NSString).draw(
                 in: NSRect(x: speedX, y: 0, width: speedWidth, height: rowHeight),
                 withAttributes: StatusDrawingStyles.attributes
             )
-            (metrics.memory.utilization.percentText as NSString).draw(
+            (memText as NSString).draw(
                 in: NSRect(x: 0, y: rowHeight, width: percentageWidth, height: rowHeight),
                 withAttributes: StatusDrawingStyles.attributes
             )
@@ -133,7 +196,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 in: NSRect(x: arrowX, y: rowHeight, width: arrowWidth, height: rowHeight),
                 withAttributes: StatusDrawingStyles.attributes
             )
-            (metrics.network.downloadBytesPerSecond.speedText as NSString).draw(
+            (downText as NSString).draw(
                 in: NSRect(x: speedX, y: rowHeight, width: speedWidth, height: rowHeight),
                 withAttributes: StatusDrawingStyles.attributes
             )
@@ -163,7 +226,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func togglePopover(_ sender: NSStatusBarButton) {
         if popover.isShown {
             popover.performClose(sender)
+            popoverVisibility.isShown = false
         } else {
+            popoverVisibility.isShown = true
+            metrics.refresh()
             NSApp.activate()
             popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
             if let window = popover.contentViewController?.view.window {

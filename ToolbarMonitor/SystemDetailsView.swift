@@ -5,9 +5,21 @@ import SwiftUI
 struct SystemDetailsView: View {
     let metrics: SystemMetrics
     @ObservedObject var tokenUsage: TokenUsageMonitor
+    @ObservedObject var popoverVisibility: PopoverVisibility
     @State private var selectedSection = DetailSection.tokens
 
     var body: some View {
+        Group {
+            if popoverVisibility.isShown {
+                content
+            } else {
+                Color.clear
+            }
+        }
+        .frame(width: 420, height: 680)
+    }
+
+    private var content: some View {
         VStack(spacing: 0) {
             header
 
@@ -16,7 +28,7 @@ struct SystemDetailsView: View {
             Group {
                 switch selectedSection {
                 case .tokens:
-                    TokenDashboardView(monitor: tokenUsage)
+                    TokenDashboardView(monitor: tokenUsage, isVisible: popoverVisibility.isShown)
                 case .system:
                     systemDashboard
                 }
@@ -27,7 +39,6 @@ struct SystemDetailsView: View {
 
             footer
         }
-        .frame(width: 420, height: 680)
         .background(
             ZStack {
                 LinearGradient(
@@ -290,13 +301,51 @@ private enum TokenPeriod: Int, CaseIterable, Identifiable {
 
 private struct TokenDashboardView: View {
     @ObservedObject var monitor: TokenUsageMonitor
-    @State private var period = TokenPeriod.week
+    let isVisible: Bool
+    @State private var period: TokenPeriod? = .today
+    @State private var selectedDateKey: String? = nil
     @State private var quotaLabelWidth: CGFloat = 0
     @State private var currentTime = Date()
 
     private var snapshot: TokenUsageSnapshot { monitor.snapshot }
-    private var selectedTokens: TokenBreakdown { snapshot.totals(last: period.rawValue) }
-    private var selectedAgents: [AgentTokenUsage] { snapshot.agents(last: period.rawValue) }
+
+    /// 当前选中的具体单日对象（若用户点击了柱状图某一根柱子，或者选中了今日且有数据）
+    private var activeSelectedDay: DailyTokenUsage? {
+        if let key = selectedDateKey {
+            return snapshot.days.first(where: { $0.dateKey == key })
+        }
+        if period == .today {
+            return snapshot.days.last
+        }
+        return nil
+    }
+
+    /// 当前激活展示的 Token 构成数据
+    private var selectedTokens: TokenBreakdown {
+        if let day = activeSelectedDay {
+            return day.tokens
+        }
+        return snapshot.totals(last: period?.rawValue ?? 1)
+    }
+
+    /// 当前激活展示的 Agent 用量列表
+    private var selectedAgents: [AgentTokenUsage] {
+        if let day = activeSelectedDay {
+            return day.agents
+        }
+        return snapshot.agents(last: period?.rawValue ?? 1)
+    }
+
+    /// 当前构成卡片的标题
+    private var breakdownTitle: String {
+        if let day = activeSelectedDay {
+            if day.dateKey == snapshot.days.last?.dateKey {
+                return "今日构成"
+            }
+            return "\(formatTokenDateKey(day.dateKey))构成"
+        }
+        return (period?.title ?? "今日") + "构成"
+    }
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
@@ -333,9 +382,11 @@ private struct TokenDashboardView: View {
             .padding(.vertical, 14)
         }
         .onReceive(Timer.publish(every: 10, on: .main, in: .common).autoconnect()) { date in
+            guard isVisible else { return }
             currentTime = date
         }
         .onReceive(monitor.$snapshot) { _ in
+            guard isVisible else { return }
             currentTime = Date()
         }
     }
@@ -393,15 +444,20 @@ private struct TokenDashboardView: View {
                 Button {
                     withAnimation(.easeOut(duration: 0.16)) {
                         period = item
+                        if item == .today {
+                            selectedDateKey = snapshot.days.last?.dateKey
+                        } else {
+                            selectedDateKey = nil
+                        }
                     }
                 } label: {
                     Text(item.title)
-                        .font(.caption2.weight(period == item ? .semibold : .regular))
-                        .foregroundStyle(period == item ? .primary : .secondary)
+                        .font(.caption2.weight(period == item && (item != .today || selectedDateKey == nil || selectedDateKey == snapshot.days.last?.dateKey) ? .semibold : .regular))
+                        .foregroundStyle(period == item && (item != .today || selectedDateKey == nil || selectedDateKey == snapshot.days.last?.dateKey) ? .primary : .secondary)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
                         .background(
-                            period == item ? Color.primary.opacity(0.09) : Color.clear,
+                            period == item && (item != .today || selectedDateKey == nil || selectedDateKey == snapshot.days.last?.dateKey) ? Color.primary.opacity(0.09) : Color.clear,
                             in: Capsule()
                         )
                 }
@@ -454,15 +510,40 @@ private struct TokenDashboardView: View {
                 Label("最近 30 天", systemImage: "chart.bar.fill")
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.secondary)
+
+                if let day = activeSelectedDay, day.dateKey != snapshot.days.last?.dateKey {
+                    Text("· 已选 \(formatTokenDateKey(day.dateKey))")
+                        .font(.caption2)
+                        .foregroundStyle(.cyan)
+                }
+
                 Spacer()
                 Text("峰值 \((snapshot.days.map(\.tokens.total).max() ?? 0).tokenText)")
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.tertiary)
             }
 
-            TokenActivityStrip(days: snapshot.days)
-                .frame(height: 42)
-                .zIndex(1)
+            TokenActivityStrip(
+                days: snapshot.days,
+                selectedDateKey: activeSelectedDay?.dateKey
+            ) { day in
+                withAnimation(.easeOut(duration: 0.16)) {
+                    if selectedDateKey == day.dateKey && day.dateKey != snapshot.days.last?.dateKey {
+                        // 再次点击已选中的非今日柱子，重置切回今日
+                        selectedDateKey = snapshot.days.last?.dateKey
+                        period = .today
+                    } else {
+                        selectedDateKey = day.dateKey
+                        if day.dateKey == snapshot.days.last?.dateKey {
+                            period = .today
+                        } else {
+                            period = nil
+                        }
+                    }
+                }
+            }
+            .frame(height: 42)
+            .zIndex(1)
 
             HStack {
                 Text("30 天前")
@@ -479,8 +560,30 @@ private struct TokenDashboardView: View {
     private var breakdown: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text(period.title + "构成")
+                Text(breakdownTitle)
                     .font(.caption.weight(.semibold))
+
+                if let day = activeSelectedDay, day.dateKey != snapshot.days.last?.dateKey {
+                    Button {
+                        withAnimation(.easeOut(duration: 0.16)) {
+                            selectedDateKey = snapshot.days.last?.dateKey
+                            period = .today
+                        }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "arrow.uturn.backward")
+                                .font(.system(size: 8))
+                            Text("返回今日")
+                                .font(.system(size: 9))
+                        }
+                        .foregroundStyle(.indigo)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.indigo.opacity(0.1), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+
                 Spacer()
                 Text(selectedTokens.total.tokenText)
                     .font(.caption.monospacedDigit().weight(.semibold))
@@ -524,14 +627,15 @@ private struct TokenDashboardView: View {
                     }
                 }
 
-                if period == .today {
+                if let day = activeSelectedDay {
                     let allTimeAgents = snapshot.agents(last: 30).map(\.agent)
-                    let todayAgents = Set(selectedAgents.map(\.agent))
-                    let inactiveAgents = allTimeAgents.filter { !todayAgents.contains($0) }
+                    let currentAgentKeys = Set(selectedAgents.map(\.agent))
+                    let inactiveAgents = allTimeAgents.filter { !currentAgentKeys.contains($0) }
                     if !inactiveAgents.isEmpty {
                         Divider()
                         HStack(spacing: 5) {
-                            Text("今日无消耗:")
+                            let label = (day.dateKey == snapshot.days.last?.dateKey) ? "今日无消耗:" : "当日无消耗:"
+                            Text(label)
                                 .font(.caption2.weight(.medium))
                                 .foregroundStyle(.tertiary)
                             Text(inactiveAgents.map { agentDisplayName($0) }.joined(separator: " · "))
@@ -661,8 +765,20 @@ private struct TokenStatCard: View {
     }
 }
 
+/// 格式化形如 "2026-10-29" 的日期字符串为 "10月29日"
+private func formatTokenDateKey(_ key: String) -> String {
+    let parts = key.split(separator: "-")
+    if parts.count == 3, let month = Int(parts[1]), let day = Int(parts[2]) {
+        return "\(month)月\(day)日"
+    }
+    return key
+}
+
 private struct TokenActivityStrip: View {
     let days: [DailyTokenUsage]
+    var selectedDateKey: String? = nil
+    var onSelectDay: ((DailyTokenUsage) -> Void)? = nil
+
     @State private var hoveredDay: DailyTokenUsage? = nil
     @State private var hoveredIndex: Int? = nil
 
@@ -678,6 +794,7 @@ private struct TokenActivityStrip: View {
                     ForEach(Array(days.enumerated()), id: \.element.id) { index, day in
                         let ratio = Double(day.tokens.total) / Double(maximum)
                         let isHovered = hoveredDay?.id == day.id
+                        let isSelected = selectedDateKey == day.dateKey
 
                         ZStack(alignment: .bottom) {
                             Rectangle()
@@ -686,15 +803,19 @@ private struct TokenActivityStrip: View {
 
                             RoundedRectangle(cornerRadius: min(width / 2, 2))
                                 .fill(
-                                    day.tokens.total == 0
-                                        ? (isHovered ? Color.primary.opacity(0.18) : Color.primary.opacity(0.06))
-                                        : (isHovered ? Color.indigo : Color.indigo.opacity(0.28 + ratio * 0.72))
+                                    isSelected
+                                        ? (day.tokens.total == 0 ? Color.cyan.opacity(0.45) : Color.cyan)
+                                        : (day.tokens.total == 0
+                                            ? (isHovered ? Color.primary.opacity(0.18) : Color.primary.opacity(0.06))
+                                            : (isHovered ? Color.indigo : Color.indigo.opacity(0.28 + ratio * 0.72)))
                                 )
                                 .frame(width: width, height: max(3, geometry.size.height * CGFloat(ratio)))
-                                .scaleEffect(x: isHovered ? 1.25 : 1.0, y: isHovered ? 1.08 : 1.0, anchor: .bottom)
-                                .shadow(color: isHovered ? Color.indigo.opacity(0.35) : Color.clear, radius: isHovered ? 2 : 0)
                         }
                         .frame(width: width, height: geometry.size.height)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            onSelectDay?(day)
+                        }
                         .onHover { hovering in
                             if hovering {
                                 hoveredDay = day
@@ -716,7 +837,7 @@ private struct TokenActivityStrip: View {
                     let clampedX = min(max(barCenterX, halfTooltip), geometry.size.width - halfTooltip)
 
                     VStack(spacing: 2) {
-                        Text(formatDateKey(day.dateKey))
+                        Text(formatTokenDateKey(day.dateKey))
                             .font(.system(size: 9, weight: .medium))
                             .foregroundStyle(.secondary)
 
@@ -736,6 +857,11 @@ private struct TokenActivityStrip: View {
                                 .font(.system(size: 8))
                                 .foregroundStyle(.green)
                         }
+
+                        Text(selectedDateKey == day.dateKey ? "已选中" : "点击查看当日")
+                            .font(.system(size: 7.5))
+                            .foregroundStyle(selectedDateKey == day.dateKey ? Color.cyan : Color.secondary)
+                            .padding(.top, 1)
                     }
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
@@ -756,14 +882,6 @@ private struct TokenActivityStrip: View {
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("最近 30 天 Token 活动")
-    }
-
-    private func formatDateKey(_ key: String) -> String {
-        let parts = key.split(separator: "-")
-        if parts.count == 3, let month = Int(parts[1]), let day = Int(parts[2]) {
-            return "\(month)月\(day)日"
-        }
-        return key
     }
 }
 
@@ -864,16 +982,60 @@ private struct AccountQuotaRow: View {
     let labelColumnWidth: CGFloat
     let currentTime: Date
 
+    @State private var isHoveringResetTime = false
+    @State private var isPinnedExactTime = false
+
     private var clampedPercent: Double {
         min(max(window.usedPercent, 0), 100)
     }
 
-    private var resetText: String {
+    /// 倒计时文本（具体到分钟）
+    private var resetCountdownText: String {
         guard let reset = window.resetsAt else { return "—" }
         let seconds = max(0, reset.timeIntervalSince(currentTime))
-        if seconds >= 24 * 60 * 60 { return "\(Int(seconds / (24 * 60 * 60)))d" }
-        if seconds >= 60 * 60 { return "\(Int(seconds / (60 * 60)))h" }
-        return "\(max(1, Int(seconds / 60)))m"
+        if seconds <= 0 {
+            return "<1m"
+        }
+        let totalMinutes = Int(seconds / 60)
+        if totalMinutes < 1 {
+            return "<1m"
+        }
+        if totalMinutes < 60 {
+            return "\(totalMinutes)m"
+        }
+        let totalHours = totalMinutes / 60
+        if totalHours < 24 {
+            let mins = totalMinutes % 60
+            if mins == 0 {
+                return "\(totalHours)h"
+            }
+            return "\(totalHours)h \(mins)m"
+        }
+        let days = totalHours / 24
+        let remainingHours = totalHours % 24
+        if remainingHours == 0 {
+            return "\(days)d"
+        }
+        return "\(days)d \(remainingHours)h"
+    }
+
+    /// 目标刷新时间点（标准 24 小时制 hh:mm 格式）
+    private var exactTimeText: String {
+        guard let reset = window.resetsAt else { return "—" }
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.dateFormat = "HH:mm"
+        return formatter.string(from: reset)
+    }
+
+    /// 当前显示的刷新时间文本（悬停或点击锁定则切换显示具体 hh:mm，移出恢复倒计时）
+    private var displayResetText: String {
+        guard window.resetsAt != nil else { return "—" }
+        if isPinnedExactTime {
+            return isHoveringResetTime ? resetCountdownText : exactTimeText
+        } else {
+            return isHoveringResetTime ? exactTimeText : resetCountdownText
+        }
     }
 
     private var expiryText: String {
@@ -882,6 +1044,54 @@ private struct AccountQuotaRow: View {
         formatter.locale = .current
         formatter.setLocalizedDateFormatFromTemplate("MdHm")
         return formatter.string(from: reset)
+    }
+
+    /// 刷新时间的悬浮提示，清晰列出日期、具体时刻 hh:mm 以及剩余相对时长
+    private var resetTooltipText: String {
+        guard let reset = window.resetsAt else { return "无重置时间" }
+        let calendar = Calendar.current
+        let datePart: String
+        if calendar.isDateInToday(reset) {
+            datePart = "今天"
+        } else if calendar.isDateInTomorrow(reset) {
+            datePart = "明天"
+        } else {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "zh_CN")
+            formatter.dateFormat = "M月d日"
+            datePart = formatter.string(from: reset)
+        }
+
+        let timeFormatter = DateFormatter()
+        timeFormatter.locale = .current
+        timeFormatter.dateFormat = "HH:mm"
+        let timePart = timeFormatter.string(from: reset)
+
+        let seconds = max(0, reset.timeIntervalSince(currentTime))
+        let totalMinutes = Int(seconds / 60)
+        let relativeDesc: String
+        if totalMinutes < 1 {
+            relativeDesc = "即将重置"
+        } else if totalMinutes < 60 {
+            relativeDesc = "约 \(totalMinutes) 分钟后"
+        } else if totalMinutes < 1440 {
+            let h = totalMinutes / 60
+            let m = totalMinutes % 60
+            relativeDesc = m > 0 ? "约 \(h) 小时 \(m) 分钟后" : "约 \(h) 小时后"
+        } else {
+            let d = totalMinutes / 1440
+            let h = (totalMinutes % 1440) / 60
+            let m = totalMinutes % 60
+            if h > 0 {
+                relativeDesc = "约 \(d) 天 \(h) 小时后"
+            } else if m > 0 {
+                relativeDesc = "约 \(d) 天 \(m) 分钟后"
+            } else {
+                relativeDesc = "约 \(d) 天后"
+            }
+        }
+
+        return "重置时间：\(datePart) \(timePart)（\(relativeDesc)）"
     }
 
     var body: some View {
@@ -906,18 +1116,39 @@ private struct AccountQuotaRow: View {
                     .font(.caption2)
                     .monospacedDigit()
                     .foregroundStyle(.tertiary)
-                    .frame(width: 66, alignment: .trailing)
+                    .frame(width: 87, alignment: .trailing)
+                    .help("\(window.label)：有效期至 \(expiryText)")
             } else {
                 Text("\(Int(clampedPercent.rounded()))%")
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .frame(width: 34, alignment: .trailing)
 
-                Text(resetText)
+                Text(displayResetText)
                     .font(.caption2)
                     .monospacedDigit()
-                    .foregroundStyle(.tertiary)
-                    .frame(width: 27, alignment: .trailing)
+                    .foregroundStyle(isHoveringResetTime || isPinnedExactTime ? .primary : .tertiary)
+                    .padding(.horizontal, 3)
+                    .padding(.vertical, 1)
+                    .background(
+                        isHoveringResetTime
+                            ? Color.primary.opacity(0.08)
+                            : (isPinnedExactTime ? Color.primary.opacity(0.04) : Color.clear),
+                        in: RoundedRectangle(cornerRadius: 4)
+                    )
+                    .frame(width: 48, alignment: .trailing)
+                    .contentShape(Rectangle())
+                    .onHover { hovering in
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            isHoveringResetTime = hovering
+                        }
+                    }
+                    .onTapGesture {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            isPinnedExactTime.toggle()
+                        }
+                    }
+                    .help(resetTooltipText)
             }
         }
         .help(helpText)
@@ -933,8 +1164,8 @@ private struct AccountQuotaRow: View {
         if let remaining = window.remainingLabel, !remaining.isEmpty {
             parts.append(remaining)
         }
-        if let reset = window.resetsAt {
-            parts.append("重置：\(reset.formatted(date: .abbreviated, time: .shortened))")
+        if window.resetsAt != nil {
+            parts.append(resetTooltipText)
         }
         return parts.joined(separator: " · ")
     }
@@ -947,7 +1178,8 @@ private struct AccountQuotaRow: View {
     }
 
     private var resetAccessibilityText: String {
-        window.resetsAt == nil ? "无重置时间" : "约 \(resetText) 后重置"
+        guard let reset = window.resetsAt else { return "无重置时间" }
+        return "重置时间 \(exactTimeText)，约 \(resetCountdownText) 后"
     }
 }
 
@@ -1009,7 +1241,8 @@ private struct AgentUsageGroupView: View {
         let outFormatted = agent.tokens.output.formattedWithSeparators
         let cacheFormatted = (agent.tokens.cacheRead + agent.tokens.cacheWrite).formattedWithSeparators
         let reasoningFormatted = agent.tokens.reasoning.formattedWithSeparators
-        return "\(agent.displayName)：\(totalFormatted) tokens (输入: \(inFormatted) · 输出: \(outFormatted) · 缓存: \(cacheFormatted) · 推理: \(reasoningFormatted)) · 占所选时段 \(Int(sharePercent.rounded()))%"
+        let costPart = agent.estimatedCost.map { " · 预估 \($0.estimatedCostText)" } ?? ""
+        return "\(agent.displayName)：\(totalFormatted) tokens (输入: \(inFormatted) · 输出: \(outFormatted) · 缓存: \(cacheFormatted) · 推理: \(reasoningFormatted)) · 占所选时段 \(Int(sharePercent.rounded()))%\(costPart)"
     }
 
     var body: some View {

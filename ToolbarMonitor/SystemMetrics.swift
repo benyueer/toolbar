@@ -97,7 +97,7 @@ final class SystemMetrics: ObservableObject {
     private func append(_ value: Double, to history: inout [Double]) {
         history.append(value)
         if history.count > historyLimit {
-            history.removeFirst()
+            history.removeFirst(history.count - historyLimit)
         }
     }
 
@@ -181,8 +181,11 @@ final class SystemMetrics: ObservableObject {
         var cpuInfoCount: mach_msg_type_number_t = 0
         var cpuCount: natural_t = 0
 
+        let hostPort = mach_host_self()
+        defer { mach_port_deallocate(mach_task_self_, hostPort) }
+
         let result = host_processor_info(
-            mach_host_self(),
+            hostPort,
             PROCESSOR_CPU_LOAD_INFO,
             &cpuCount,
             &cpuInfo,
@@ -244,9 +247,12 @@ final class SystemMetrics: ObservableObject {
             MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size
         )
 
+        let hostPort = mach_host_self()
+        defer { mach_port_deallocate(mach_task_self_, hostPort) }
+
         let result = withUnsafeMutablePointer(to: &statistics) { pointer in
             pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
-                host_statistics64(mach_host_self(), HOST_VM_INFO64, rebound, &count)
+                host_statistics64(hostPort, HOST_VM_INFO64, rebound, &count)
             }
         }
 
@@ -256,7 +262,7 @@ final class SystemMetrics: ObservableObject {
         }
 
         var pageSize: vm_size_t = 0
-        host_page_size(mach_host_self(), &pageSize)
+        host_page_size(hostPort, &pageSize)
         let pageBytes = UInt64(pageSize)
 
         let active = UInt64(statistics.active_count) * pageBytes
