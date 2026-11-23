@@ -18,8 +18,12 @@ getUsageLimits({
   forceRefresh: process.argv.includes('--refresh'),
   providers,
 }).then((result) => {
-  process.stdout.write(JSON.stringify(result))
+  // 输出完成后立即退出进程，避免 Node.js fetch (undici) 的 HTTP keep-alive 连接池挂起事件循环空等 5-7 秒
+  process.stdout.write(JSON.stringify(result), () => {
+    process.exit(0)
+  })
 }).catch((error) => {
-  process.stderr.write(String(error?.stack || error))
-  process.exitCode = 1
+  process.stderr.write(String(error?.stack || error), () => {
+    process.exit(1)
+  })
 })

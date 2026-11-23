@@ -1,6 +1,31 @@
 import AppKit
 import SwiftUI
 
+/// 额度面板共享的静态日期格式化器，彻底消除每次渲染或悬停时重复创建 DateFormatter 实例的高昂开销
+@MainActor
+private enum QuotaDateFormatters {
+    static let exactTime: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
+
+    static let expiry: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.setLocalizedDateFormatFromTemplate("MdHm")
+        return formatter
+    }()
+
+    static let monthDay: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "M月d日"
+        return formatter
+    }()
+}
+
 @MainActor
 struct SystemDetailsView: View {
     let metrics: SystemMetrics
@@ -40,17 +65,15 @@ struct SystemDetailsView: View {
             footer
         }
         .background(
-            ZStack {
-                LinearGradient(
-                    colors: [
-                        Color.white.opacity(0.035),
-                        Color.indigo.opacity(0.018),
-                        Color.black.opacity(0.045)
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            }
+            LinearGradient(
+                colors: [
+                    Color.white.opacity(0.035),
+                    Color.indigo.opacity(0.018),
+                    Color.black.opacity(0.045)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
         )
     }
 
@@ -209,7 +232,8 @@ private struct SystemDashboardView: View {
     }
 
     private var networkHistory: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let maxScale = networkScaleMaximum
+        return VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 12) {
                 Label("实时网速", systemImage: "network")
                     .font(.caption.weight(.medium))
@@ -234,10 +258,11 @@ private struct SystemDashboardView: View {
             ZStack(alignment: .topTrailing) {
                 NetworkHistoryChart(
                     download: metrics.downloadHistory,
-                    upload: metrics.uploadHistory
+                    upload: metrics.uploadHistory,
+                    scaleMaximum: maxScale
                 )
 
-                Text(networkScaleMaximum.speedText)
+                Text(maxScale.speedText)
                     .font(.system(size: 8, weight: .medium, design: .rounded))
                     .foregroundStyle(.tertiary)
                     .padding(.top, 2)
@@ -309,10 +334,10 @@ private struct TokenDashboardView: View {
 
     private var snapshot: TokenUsageSnapshot { monitor.snapshot }
 
-    /// 当前选中的具体单日对象（若用户点击了柱状图某一根柱子，或者选中了今日且有数据）
+    /// 当前选中的具体单日对象（O(1) 哈希查找）
     private var activeSelectedDay: DailyTokenUsage? {
         if let key = selectedDateKey {
-            return snapshot.days.first(where: { $0.dateKey == key })
+            return snapshot.day(forKey: key)
         }
         if period == .today {
             return snapshot.days.last
@@ -320,7 +345,7 @@ private struct TokenDashboardView: View {
         return nil
     }
 
-    /// 当前激活展示的 Token 构成数据
+    /// 当前激活展示的 Token 构成数据（O(1) 预计算读取）
     private var selectedTokens: TokenBreakdown {
         if let day = activeSelectedDay {
             return day.tokens
@@ -328,7 +353,7 @@ private struct TokenDashboardView: View {
         return snapshot.totals(last: period?.rawValue ?? 1)
     }
 
-    /// 当前激活展示的 Agent 用量列表
+    /// 当前激活展示的 Agent 用量列表（O(1) 预计算读取）
     private var selectedAgents: [AgentTokenUsage] {
         if let day = activeSelectedDay {
             return day.agents
@@ -381,7 +406,8 @@ private struct TokenDashboardView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 14)
         }
-        .onReceive(Timer.publish(every: 10, on: .main, in: .common).autoconnect()) { date in
+        // 倒计时最小粒度为分钟，使用 30 秒带容差定时器减少弹窗打开时的重绘频率
+        .onReceive(Timer.publish(every: 30, tolerance: 5, on: .main, in: .common).autoconnect()) { date in
             guard isVisible else { return }
             currentTime = date
         }
@@ -392,12 +418,14 @@ private struct TokenDashboardView: View {
     }
 
     private var summaryCards: some View {
-        HStack(spacing: 7) {
+        let todayTotal = snapshot.today.total
+        let monthTotal = snapshot.last30Days.total
+        return HStack(spacing: 7) {
             TokenStatCard(
                 title: "今日 Token",
-                value: snapshot.today.total.tokenText,
+                value: todayTotal.tokenText,
                 detail: "tokens",
-                tooltip: "今日总用量：\(snapshot.today.total.formattedWithSeparators) tokens"
+                tooltip: "今日总用量：\(todayTotal.formattedWithSeparators) tokens"
             )
             TokenStatCard(
                 title: "预估花费",
@@ -407,20 +435,21 @@ private struct TokenDashboardView: View {
             )
             TokenStatCard(
                 title: "30 天",
-                value: snapshot.last30Days.total.tokenText,
+                value: monthTotal.tokenText,
                 detail: "累计",
-                tooltip: "30天累计用量：\(snapshot.last30Days.total.formattedWithSeparators) tokens"
+                tooltip: "30天累计用量：\(monthTotal.formattedWithSeparators) tokens"
             )
             TokenStatCard(
                 title: "Agents",
-                value: "\(snapshot.agents(last: 30).count)",
+                value: "\(snapshot.agents30Days.count)",
                 detail: "已发现"
             )
         }
     }
 
     private var periodControl: some View {
-        HStack(spacing: 6) {
+        let lastDayKey = snapshot.days.last?.dateKey
+        return HStack(spacing: 6) {
             Text("Agent 用量")
                 .font(.caption.weight(.semibold))
 
@@ -441,23 +470,24 @@ private struct TokenDashboardView: View {
             Spacer()
 
             ForEach(TokenPeriod.allCases) { item in
+                let isSelected = period == item && (item != .today || selectedDateKey == nil || selectedDateKey == lastDayKey)
                 Button {
                     withAnimation(.easeOut(duration: 0.16)) {
                         period = item
                         if item == .today {
-                            selectedDateKey = snapshot.days.last?.dateKey
+                            selectedDateKey = lastDayKey
                         } else {
                             selectedDateKey = nil
                         }
                     }
                 } label: {
                     Text(item.title)
-                        .font(.caption2.weight(period == item && (item != .today || selectedDateKey == nil || selectedDateKey == snapshot.days.last?.dateKey) ? .semibold : .regular))
-                        .foregroundStyle(period == item && (item != .today || selectedDateKey == nil || selectedDateKey == snapshot.days.last?.dateKey) ? .primary : .secondary)
+                        .font(.caption2.weight(isSelected ? .semibold : .regular))
+                        .foregroundStyle(isSelected ? .primary : .secondary)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
                         .background(
-                            period == item && (item != .today || selectedDateKey == nil || selectedDateKey == snapshot.days.last?.dateKey) ? Color.primary.opacity(0.09) : Color.clear,
+                            isSelected ? Color.primary.opacity(0.09) : Color.clear,
                             in: Capsule()
                         )
                 }
@@ -482,7 +512,9 @@ private struct TokenDashboardView: View {
             }
 
             VStack(spacing: 0) {
-                ForEach(Array(snapshot.quotaProviders.enumerated()), id: \.element.id) { index, provider in
+                let providers = snapshot.quotaProviders
+                let lastProviderId = providers.last?.id
+                ForEach(Array(providers.enumerated()), id: \.element.id) { index, provider in
                     ProviderQuotaGroupView(
                         provider: provider,
                         labelColumnWidth: quotaLabelWidth,
@@ -491,7 +523,7 @@ private struct TokenDashboardView: View {
                     )
                     .padding(.vertical, 10)
 
-                    if provider.id != snapshot.quotaProviders.last?.id {
+                    if provider.id != lastProviderId {
                         Divider()
                     }
                 }
@@ -500,41 +532,48 @@ private struct TokenDashboardView: View {
             .tokenCard()
         }
         .onPreferenceChange(QuotaLabelWidthKey.self) { width in
-            quotaLabelWidth = min(max(quotaLabelWidth, width), 72)
+            let clamped = min(max(quotaLabelWidth, width), 72)
+            if abs(clamped - quotaLabelWidth) > 0.5 {
+                quotaLabelWidth = clamped
+            }
         }
     }
 
     private var activityStrip: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let currentDay = activeSelectedDay
+        let lastDayKey = snapshot.days.last?.dateKey
+        let maxTokens = snapshot.maxDailyTokens
+        return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label("最近 30 天", systemImage: "chart.bar.fill")
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.secondary)
 
-                if let day = activeSelectedDay, day.dateKey != snapshot.days.last?.dateKey {
+                if let day = currentDay, day.dateKey != lastDayKey {
                     Text("· 已选 \(formatTokenDateKey(day.dateKey))")
                         .font(.caption2)
                         .foregroundStyle(.cyan)
                 }
 
                 Spacer()
-                Text("峰值 \((snapshot.days.map(\.tokens.total).max() ?? 0).tokenText)")
+                Text("峰值 \(maxTokens.tokenText)")
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.tertiary)
             }
 
             TokenActivityStrip(
                 days: snapshot.days,
-                selectedDateKey: activeSelectedDay?.dateKey
+                maxTokens: max(maxTokens, 1),
+                selectedDateKey: currentDay?.dateKey
             ) { day in
                 withAnimation(.easeOut(duration: 0.16)) {
-                    if selectedDateKey == day.dateKey && day.dateKey != snapshot.days.last?.dateKey {
+                    if selectedDateKey == day.dateKey && day.dateKey != lastDayKey {
                         // 再次点击已选中的非今日柱子，重置切回今日
-                        selectedDateKey = snapshot.days.last?.dateKey
+                        selectedDateKey = lastDayKey
                         period = .today
                     } else {
                         selectedDateKey = day.dateKey
-                        if day.dateKey == snapshot.days.last?.dateKey {
+                        if day.dateKey == lastDayKey {
                             period = .today
                         } else {
                             period = nil
@@ -558,15 +597,18 @@ private struct TokenDashboardView: View {
     }
 
     private var breakdown: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let tokens = selectedTokens
+        let currentDay = activeSelectedDay
+        let lastDayKey = snapshot.days.last?.dateKey
+        return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text(breakdownTitle)
                     .font(.caption.weight(.semibold))
 
-                if let day = activeSelectedDay, day.dateKey != snapshot.days.last?.dateKey {
+                if let day = currentDay, day.dateKey != lastDayKey {
                     Button {
                         withAnimation(.easeOut(duration: 0.16)) {
-                            selectedDateKey = snapshot.days.last?.dateKey
+                            selectedDateKey = lastDayKey
                             period = .today
                         }
                     } label: {
@@ -585,20 +627,20 @@ private struct TokenDashboardView: View {
                 }
 
                 Spacer()
-                Text(selectedTokens.total.tokenText)
+                Text(tokens.total.tokenText)
                     .font(.caption.monospacedDigit().weight(.semibold))
                     .foregroundStyle(.indigo)
             }
 
             HStack(spacing: 6) {
-                TokenBreakdownPill(title: "输入", value: selectedTokens.input, color: .blue)
-                TokenBreakdownPill(title: "输出", value: selectedTokens.output, color: .mint)
+                TokenBreakdownPill(title: "输入", value: tokens.input, color: .blue)
+                TokenBreakdownPill(title: "输出", value: tokens.output, color: .mint)
                 TokenBreakdownPill(
                     title: "缓存",
-                    value: selectedTokens.cacheRead + selectedTokens.cacheWrite,
+                    value: tokens.cacheRead + tokens.cacheWrite,
                     color: .purple
                 )
-                TokenBreakdownPill(title: "推理", value: selectedTokens.reasoning, color: .orange)
+                TokenBreakdownPill(title: "推理", value: tokens.reasoning, color: .orange)
             }
         }
         .padding(11)
@@ -606,31 +648,36 @@ private struct TokenDashboardView: View {
     }
 
     private var agentList: some View {
-        VStack(spacing: 0) {
-            if selectedAgents.isEmpty {
+        let agents = selectedAgents
+        let totalTokens = selectedTokens.total
+        let currentDay = activeSelectedDay
+        return VStack(spacing: 0) {
+            if agents.isEmpty {
                 Text("这个时间范围内没有 Token 记录")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 10)
             } else {
-                ForEach(Array(selectedAgents.enumerated()), id: \.element.id) { index, agent in
+                let lastAgentId = agents.last?.id
+                ForEach(Array(agents.enumerated()), id: \.element.id) { index, agent in
                     AgentUsageGroupView(
                         agent: agent,
                         color: agentColor(agent.agent, index: index),
-                        total: selectedTokens.total
+                        total: totalTokens
                     )
                     .padding(.vertical, 10)
 
-                    if agent.id != selectedAgents.last?.id {
+                    if agent.id != lastAgentId {
                         Divider()
                     }
                 }
 
-                if let day = activeSelectedDay {
-                    let allTimeAgents = snapshot.agents(last: 30).map(\.agent)
-                    let currentAgentKeys = Set(selectedAgents.map(\.agent))
-                    let inactiveAgents = allTimeAgents.filter { !currentAgentKeys.contains($0) }
+                if let day = currentDay {
+                    let currentAgentKeys = Set(agents.map(\.agent))
+                    let inactiveAgents = snapshot.agents30Days.compactMap { item in
+                        currentAgentKeys.contains(item.agent) ? nil : item.displayName
+                    }
                     if !inactiveAgents.isEmpty {
                         Divider()
                         HStack(spacing: 5) {
@@ -638,7 +685,7 @@ private struct TokenDashboardView: View {
                             Text(label)
                                 .font(.caption2.weight(.medium))
                                 .foregroundStyle(.tertiary)
-                            Text(inactiveAgents.map { agentDisplayName($0) }.joined(separator: " · "))
+                            Text(inactiveAgents.joined(separator: " · "))
                                 .font(.caption2)
                                 .foregroundStyle(.tertiary)
                         }
@@ -650,20 +697,6 @@ private struct TokenDashboardView: View {
         }
         .padding(.horizontal, 11)
         .tokenCard()
-    }
-
-    private func agentDisplayName(_ agent: String) -> String {
-        switch agent.lowercased() {
-        case "codex": "Codex"
-        case "claude": "Claude Code"
-        case "gemini": "Gemini CLI"
-        case "antigravity": "Antigravity"
-        case "agy-cli", "antigravity-cli", "agy": "Agy CLI"
-        case "opencode": "OpenCode"
-        case "cursor": "Cursor"
-        case "copilot": "GitHub Copilot"
-        default: agent.capitalized
-        }
     }
 
     @ViewBuilder
@@ -776,6 +809,7 @@ private func formatTokenDateKey(_ key: String) -> String {
 
 private struct TokenActivityStrip: View {
     let days: [DailyTokenUsage]
+    let maxTokens: Int64
     var selectedDateKey: String? = nil
     var onSelectDay: ((DailyTokenUsage) -> Void)? = nil
 
@@ -784,7 +818,7 @@ private struct TokenActivityStrip: View {
 
     var body: some View {
         GeometryReader { geometry in
-            let maximum = max(days.map(\.tokens.total).max() ?? 0, 1)
+            let maximum = Double(max(maxTokens, 1))
             let gap: CGFloat = 2
             let totalGap = gap * CGFloat(max(days.count - 1, 0))
             let width = max(1, (geometry.size.width - totalGap) / CGFloat(max(days.count, 1)))
@@ -792,7 +826,7 @@ private struct TokenActivityStrip: View {
             ZStack(alignment: .topLeading) {
                 HStack(alignment: .bottom, spacing: gap) {
                     ForEach(Array(days.enumerated()), id: \.element.id) { index, day in
-                        let ratio = Double(day.tokens.total) / Double(maximum)
+                        let ratio = Double(day.tokens.total) / maximum
                         let isHovered = hoveredDay?.id == day.id
                         let isSelected = selectedDateKey == day.dateKey
 
@@ -867,8 +901,8 @@ private struct TokenActivityStrip: View {
                     .padding(.vertical, 4)
                     .background(
                         RoundedRectangle(cornerRadius: 6)
-                            .fill(.ultraThinMaterial)
-                            .shadow(color: .black.opacity(0.18), radius: 4, x: 0, y: 2)
+                            .fill(.regularMaterial)
+                            .shadow(color: .black.opacity(0.16), radius: 3, x: 0, y: 2)
                             .overlay(
                                 RoundedRectangle(cornerRadius: 6)
                                     .stroke(Color.primary.opacity(0.12), lineWidth: 0.5)
@@ -922,7 +956,9 @@ private struct ProviderQuotaGroupView: View {
     let currentTime: Date
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let usageList = usageWindows
+        let resetList = resetWindows
+        return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 AgentBrandLogo(agent: provider.canonicalAgent, color: color, size: 14)
                     .frame(width: 14, height: 14)
@@ -934,9 +970,9 @@ private struct ProviderQuotaGroupView: View {
                 Spacer()
             }
 
-            if !usageWindows.isEmpty {
+            if !usageList.isEmpty {
                 VStack(spacing: 5) {
-                    ForEach(usageWindows) { window in
+                    ForEach(usageList) { window in
                         AccountQuotaRow(
                             window: window,
                             labelColumnWidth: labelColumnWidth,
@@ -946,14 +982,14 @@ private struct ProviderQuotaGroupView: View {
                 }
             }
 
-            if !resetWindows.isEmpty {
+            if !resetList.isEmpty {
                 Text("重置权益")
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.tertiary)
                     .padding(.top, 1)
 
                 VStack(spacing: 5) {
-                    ForEach(resetWindows) { window in
+                    ForEach(resetList) { window in
                         AccountQuotaRow(
                             window: window,
                             labelColumnWidth: labelColumnWidth,
@@ -974,7 +1010,6 @@ private struct ProviderQuotaGroupView: View {
     private var resetWindows: [QuotaWindowUsage] {
         provider.windows.filter { $0.style == .resetCredit }
     }
-
 }
 
 private struct AccountQuotaRow: View {
@@ -1019,16 +1054,13 @@ private struct AccountQuotaRow: View {
         return "\(days)d \(remainingHours)h"
     }
 
-    /// 目标刷新时间点（标准 24 小时制 hh:mm 格式）
+    /// 目标刷新时间点（复用共享静态 DateFormatter）
     private var exactTimeText: String {
         guard let reset = window.resetsAt else { return "—" }
-        let formatter = DateFormatter()
-        formatter.locale = .current
-        formatter.dateFormat = "HH:mm"
-        return formatter.string(from: reset)
+        return QuotaDateFormatters.exactTime.string(from: reset)
     }
 
-    /// 当前显示的刷新时间文本（悬停或点击锁定则切换显示具体 hh:mm，移出恢复倒计时）
+    /// 当前显示的刷新时间文本
     private var displayResetText: String {
         guard window.resetsAt != nil else { return "—" }
         if isPinnedExactTime {
@@ -1040,13 +1072,10 @@ private struct AccountQuotaRow: View {
 
     private var expiryText: String {
         guard let reset = window.resetsAt else { return "—" }
-        let formatter = DateFormatter()
-        formatter.locale = .current
-        formatter.setLocalizedDateFormatFromTemplate("MdHm")
-        return formatter.string(from: reset)
+        return QuotaDateFormatters.expiry.string(from: reset)
     }
 
-    /// 刷新时间的悬浮提示，清晰列出日期、具体时刻 hh:mm 以及剩余相对时长
+    /// 刷新时间的悬浮提示（复用共享静态 DateFormatter）
     private var resetTooltipText: String {
         guard let reset = window.resetsAt else { return "无重置时间" }
         let calendar = Calendar.current
@@ -1056,17 +1085,10 @@ private struct AccountQuotaRow: View {
         } else if calendar.isDateInTomorrow(reset) {
             datePart = "明天"
         } else {
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: "zh_CN")
-            formatter.dateFormat = "M月d日"
-            datePart = formatter.string(from: reset)
+            datePart = QuotaDateFormatters.monthDay.string(from: reset)
         }
 
-        let timeFormatter = DateFormatter()
-        timeFormatter.locale = .current
-        timeFormatter.dateFormat = "HH:mm"
-        let timePart = timeFormatter.string(from: reset)
-
+        let timePart = QuotaDateFormatters.exactTime.string(from: reset)
         let seconds = max(0, reset.timeIntervalSince(currentTime))
         let totalMinutes = Int(seconds / 60)
         let relativeDesc: String
@@ -1095,7 +1117,9 @@ private struct AccountQuotaRow: View {
     }
 
     var body: some View {
-        HStack(spacing: 5) {
+        let roundedPercent = Int(clampedPercent.rounded())
+        let tooltip = resetTooltipText
+        return HStack(spacing: 5) {
             Text(window.label)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -1112,14 +1136,15 @@ private struct AccountQuotaRow: View {
                 .animation(.easeOut(duration: 0.45), value: clampedPercent)
 
             if window.style == .resetCredit {
-                Text(expiryText)
+                let exp = expiryText
+                Text(exp)
                     .font(.caption2)
                     .monospacedDigit()
                     .foregroundStyle(.tertiary)
                     .frame(width: 87, alignment: .trailing)
-                    .help("\(window.label)：有效期至 \(expiryText)")
+                    .help("\(window.label)：有效期至 \(exp)")
             } else {
-                Text("\(Int(clampedPercent.rounded()))%")
+                Text("\(roundedPercent)%")
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .frame(width: 34, alignment: .trailing)
@@ -1148,38 +1173,36 @@ private struct AccountQuotaRow: View {
                             isPinnedExactTime.toggle()
                         }
                     }
-                    .help(resetTooltipText)
+                    .help(tooltip)
             }
         }
-        .help(helpText)
+        .help(makeHelpText(roundedPercent: roundedPercent, resetTooltip: tooltip))
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilityText)
+        .accessibilityLabel(makeAccessibilityText(roundedPercent: roundedPercent))
     }
 
-    private var helpText: String {
+    private func makeHelpText(roundedPercent: Int, resetTooltip: String) -> String {
         if window.style == .resetCredit {
             return "\(window.label)：有效期至 \(expiryText)"
         }
-        var parts = ["\(window.label)：已用 \(Int(clampedPercent.rounded()))%"]
+        var parts = ["\(window.label)：已用 \(roundedPercent)%"]
         if let remaining = window.remainingLabel, !remaining.isEmpty {
             parts.append(remaining)
         }
         if window.resetsAt != nil {
-            parts.append(resetTooltipText)
+            parts.append(resetTooltip)
         }
         return parts.joined(separator: " · ")
     }
 
-    private var accessibilityText: String {
+    private func makeAccessibilityText(roundedPercent: Int) -> String {
         if window.style == .resetCredit {
             return "\(window.label)，有效期至 \(expiryText)"
         }
-        return "\(window.label)，已用 \(Int(clampedPercent.rounded()))%，\(resetAccessibilityText)"
-    }
-
-    private var resetAccessibilityText: String {
-        guard let reset = window.resetsAt else { return "无重置时间" }
-        return "重置时间 \(exactTimeText)，约 \(resetCountdownText) 后"
+        let resetDesc = window.resetsAt != nil
+            ? "重置时间 \(exactTimeText)，约 \(resetCountdownText) 后"
+            : "无重置时间"
+        return "\(window.label)，已用 \(roundedPercent)%，\(resetDesc)"
     }
 }
 
@@ -1246,7 +1269,9 @@ private struct AgentUsageGroupView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let percent = sharePercent
+        let roundedPercent = Int(percent.rounded())
+        return VStack(alignment: .leading, spacing: 6) {
             Button {
                 guard !agent.models.isEmpty else { return }
                 withAnimation(.easeOut(duration: 0.18)) {
@@ -1281,8 +1306,8 @@ private struct AgentUsageGroupView: View {
                             .foregroundStyle(.secondary)
                             .frame(width: 30, alignment: .leading)
 
-                        AccountQuotaBar(percent: sharePercent, style: .usage, tint: color)
-                            .animation(.easeOut(duration: 0.45), value: sharePercent)
+                        AccountQuotaBar(percent: percent, style: .usage, tint: color)
+                            .animation(.easeOut(duration: 0.45), value: percent)
 
                         Text(agent.tokens.total.tokenText)
                             .font(.system(.caption, design: .monospaced))
@@ -1290,7 +1315,7 @@ private struct AgentUsageGroupView: View {
                             .monospacedDigit()
                             .frame(width: 48, alignment: .trailing)
 
-                        Text("\(Int(sharePercent.rounded()))%")
+                        Text("\(roundedPercent)%")
                             .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(.tertiary)
                             .frame(width: 34, alignment: .trailing)
@@ -1301,7 +1326,7 @@ private struct AgentUsageGroupView: View {
             .buttonStyle(.plain)
             .help(detailedHelpText)
             .accessibilityLabel(
-                "\(agent.displayName)，\(agent.tokens.total.tokenText) Token，占所选时段 \(Int(sharePercent.rounded()))%"
+                "\(agent.displayName)，\(agent.tokens.total.tokenText) Token，占所选时段 \(roundedPercent)%"
             )
             .accessibilityHint(agent.models.isEmpty ? "没有模型明细" : "展开或收起模型明细")
 
@@ -1350,7 +1375,9 @@ private struct ModelUsageRow: View {
     }
 
     var body: some View {
-        HStack(spacing: 5) {
+        let percent = sharePercent
+        let roundedPercent = Int(percent.rounded())
+        return HStack(spacing: 5) {
             Text(model.name)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -1358,8 +1385,8 @@ private struct ModelUsageRow: View {
                 .truncationMode(.middle)
                 .frame(width: 112, alignment: .leading)
 
-            AccountQuotaBar(percent: sharePercent, style: .usage, tint: color.opacity(0.8))
-                .animation(.easeOut(duration: 0.45), value: sharePercent)
+            AccountQuotaBar(percent: percent, style: .usage, tint: color.opacity(0.8))
+                .animation(.easeOut(duration: 0.45), value: percent)
 
             Text(model.tokens.total.tokenText)
                 .font(.system(.caption2, design: .monospaced))
@@ -1367,7 +1394,7 @@ private struct ModelUsageRow: View {
                 .monospacedDigit()
                 .frame(width: 48, alignment: .trailing)
 
-            Text("\(Int(sharePercent.rounded()))%")
+            Text("\(roundedPercent)%")
                 .font(.system(.caption2, design: .monospaced))
                 .foregroundStyle(.tertiary)
                 .frame(width: 34, alignment: .trailing)
@@ -1375,7 +1402,7 @@ private struct ModelUsageRow: View {
         .help(detailedHelpText)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(
-            "\(model.name)，\(model.tokens.total.tokenText) Token，占该 Agent \(Int(sharePercent.rounded()))%"
+            "\(model.name)，\(model.tokens.total.tokenText) Token，占该 Agent \(roundedPercent)%"
         )
     }
 }
@@ -1394,7 +1421,6 @@ private final class AgentLogoStore {
 
         let image: NSImage?
         if key == "antigravity" || key == "agy-cli" || key == "agy" || key == "antigravity-cli" {
-            // Antigravity 和 Agy CLI 均使用内置官方品牌图标
             image = bundledBrandIcon(for: "antigravity") ?? installedApplicationIcon(for: "antigravity")
         } else {
             image = installedApplicationIcon(for: key) ?? bundledBrandIcon(for: key)
@@ -1514,43 +1540,40 @@ private struct AgentBrandLogo: View {
     }
 }
 
+/// 轻量级卡片容器修饰符：由于 NSPopover 窗口自身已具备系统毛玻璃背景，
+/// 避免在每个卡片上重复创建独立的 NSVisualEffectView (.ultraThinMaterial) 与双重动态高斯阴影，显著降低 GPU 离屏合成负载。
 private extension View {
     func tokenCard() -> some View {
         background(
-            ZStack {
-                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .fill(.ultraThinMaterial)
-
-                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color.white.opacity(0.18),
-                                Color.white.opacity(0.03),
-                                Color.black.opacity(0.05)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color.primary.opacity(0.055),
+                            Color.primary.opacity(0.03),
+                            Color.black.opacity(0.04)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: [
+                                    Color.white.opacity(0.32),
+                                    Color.white.opacity(0.10),
+                                    Color.indigo.opacity(0.18),
+                                    Color.primary.opacity(0.06)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 0.75
                         )
-                    )
-
-                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .strokeBorder(
-                        LinearGradient(
-                            colors: [
-                                Color.white.opacity(0.45),
-                                Color.white.opacity(0.12),
-                                Color.indigo.opacity(0.20),
-                                Color.primary.opacity(0.06)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        lineWidth: 0.75
-                    )
-            }
-            .shadow(color: Color.black.opacity(0.12), radius: 6, x: 0, y: 3)
-            .shadow(color: Color.indigo.opacity(0.08), radius: 10, x: 0, y: 4)
+                )
+                .shadow(color: Color.black.opacity(0.10), radius: 5, x: 0, y: 2)
         )
     }
 }
@@ -1562,7 +1585,8 @@ private struct SpeedValue: View {
     let symbol: String
 
     var body: some View {
-        HStack(spacing: 4) {
+        let formattedSpeed = value.speedText
+        return HStack(spacing: 4) {
             Image(systemName: symbol)
                 .font(.system(size: 8, weight: .bold))
                 .foregroundStyle(color)
@@ -1571,14 +1595,14 @@ private struct SpeedValue: View {
                 Text(title)
                     .font(.system(size: 8))
                     .foregroundStyle(.tertiary)
-                Text(value.speedText)
+                Text(formattedSpeed)
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
                     .monospacedDigit()
             }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(title)速度")
-        .accessibilityValue(value.speedText)
+        .accessibilityValue(formattedSpeed)
     }
 }
 
@@ -1590,7 +1614,8 @@ private struct MetricGauge: View {
     let systemImage: String
 
     var body: some View {
-        HStack(spacing: 12) {
+        let formattedPercent = value.percentText
+        return HStack(spacing: 12) {
             ZStack {
                 Circle()
                     .stroke(color.opacity(0.14), lineWidth: 7)
@@ -1606,13 +1631,13 @@ private struct MetricGauge: View {
             }
             .frame(width: 54, height: 54)
             .accessibilityLabel(title)
-            .accessibilityValue(value.percentText)
+            .accessibilityValue(formattedPercent)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text(value.percentText)
+                Text(formattedPercent)
                     .font(.system(size: 24, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                 Text(detail)
@@ -1665,7 +1690,7 @@ private struct HistoryChart: View {
                     }
                     .padding(.horizontal, 6)
                     .padding(.vertical, 3)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 5))
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 5))
                     .shadow(radius: 2)
                     .position(
                         x: min(max(location.x, 70), geometry.size.width - 70),
@@ -1720,8 +1745,9 @@ private struct HistoryChart: View {
         guard values.count > 1 else { return }
 
         var path = Path()
+        let countMinusOne = CGFloat(values.count - 1)
         for (index, value) in values.enumerated() {
-            let x = size.width * CGFloat(index) / CGFloat(values.count - 1)
+            let x = size.width * CGFloat(index) / countMinusOne
             let y = size.height * (1 - CGFloat(min(max(value, 0), 1)))
             let point = CGPoint(x: x, y: y)
             index == 0 ? path.move(to: point) : path.addLine(to: point)
@@ -1733,11 +1759,8 @@ private struct HistoryChart: View {
 private struct NetworkHistoryChart: View {
     let download: [Double]
     let upload: [Double]
+    let scaleMaximum: Double
     @State private var hoverLocation: CGPoint?
-
-    private var scaleMaximum: Double {
-        max(download.max() ?? 0, upload.max() ?? 0, 1_000) * 1.1
-    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -1770,7 +1793,7 @@ private struct NetworkHistoryChart: View {
                     }
                     .padding(.horizontal, 6)
                     .padding(.vertical, 3)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 5))
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 5))
                     .shadow(radius: 2)
                     .position(
                         x: min(max(location.x, 70), geometry.size.width - 70),
@@ -1830,10 +1853,14 @@ private struct NetworkHistoryChart: View {
     ) {
         guard values.count > 1 else { return }
 
+        // 在循环外提取常量，避免在 180 次循环内部重复遍历数组求 max() 的 O(N²) 性能陷阱
+        let maxVal = max(scaleMaximum, 1)
+        let countMinusOne = CGFloat(values.count - 1)
         var path = Path()
+
         for (index, value) in values.enumerated() {
-            let x = size.width * CGFloat(index) / CGFloat(values.count - 1)
-            let ratio = min(max(value / scaleMaximum, 0), 1)
+            let x = size.width * CGFloat(index) / countMinusOne
+            let ratio = min(max(value / maxVal, 0), 1)
             let y = size.height * (1 - CGFloat(ratio))
             let point = CGPoint(x: x, y: y)
             index == 0 ? path.move(to: point) : path.addLine(to: point)
@@ -1846,7 +1873,7 @@ private struct NetworkHistoryChart: View {
         )
 
         if let last = values.last {
-            let y = size.height * (1 - CGFloat(min(max(last / scaleMaximum, 0), 1)))
+            let y = size.height * (1 - CGFloat(min(max(last / maxVal, 0), 1)))
             let marker = CGRect(x: size.width - 2.5, y: y - 2.5, width: 5, height: 5)
             context.fill(Path(ellipseIn: marker), with: .color(color))
         }

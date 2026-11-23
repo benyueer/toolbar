@@ -14,9 +14,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let popover = NSPopover()
     private let popoverVisibility = PopoverVisibility()
     private var statusItem: NSStatusItem?
-    private var metricsObservation: AnyCancellable?
     private var tokenObservation: AnyCancellable?
     private var lastRenderedState: StatusDisplayState?
+
+    // 缓存 Token 与花费文本对应的测量宽度，避免每秒因网速变化重绘时重复调用 CoreText 测量
+    private var cachedTokenMeasureKey: String?
+    private var cachedTokenWidth: CGFloat = 35
+    private var hasConfiguredPopoverWindow = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard isSingleInstance() else {
@@ -63,12 +67,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // MARK: - NSPopoverDelegate
 
     func popoverWillShow(_ notification: Notification) {
+        metrics.isDashboardVisible = true
         popoverVisibility.isShown = true
         metrics.refresh()
     }
 
     func popoverDidClose(_ notification: Notification) {
         popoverVisibility.isShown = false
+        metrics.isDashboardVisible = false
     }
 
     private func configureStatusItem() {
@@ -85,10 +91,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func observeMetrics() {
-        metricsObservation = metrics.objectWillChange.sink { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.updateStatusItem()
-            }
+        // 直接使用主线程同步回调，避免 Combine + DispatchQueue.main.async 双重异步派发
+        metrics.onMetricsUpdated = { [weak self] in
+            self?.updateStatusItem()
         }
         tokenObservation = tokenUsage.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async {
@@ -132,16 +137,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard currentState != lastRenderedState else { return }
         lastRenderedState = currentState
 
+        let tokenWidth = resolvedTokenWidth(tokenText: tokenText, costText: costText)
         let image = makeStatusImage(
             cpuText: cpuText,
             memText: memText,
             upText: upText,
             downText: downText,
             tokenText: tokenText,
-            costText: costText
+            costText: costText,
+            tokenWidth: tokenWidth
         )
         button.image = image
-        statusItem?.length = image.size.width + 2
+
+        let targetLength = image.size.width + 2
+        if let statusItem, abs(statusItem.length - targetLength) > 0.1 {
+            statusItem.length = targetLength
+        }
+
         let estimatedCostLabel = tokenUsage.snapshot.todayEstimatedCost.map {
             "，预估花费 \($0.estimatedCostText)"
         } ?? ""
@@ -152,17 +164,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         )
     }
 
+    private func resolvedTokenWidth(tokenText: String, costText: String) -> CGFloat {
+        let key = "\(tokenText)|\(costText)"
+        if key == cachedTokenMeasureKey {
+            return cachedTokenWidth
+        }
+        let tokenTextSize = (tokenText as NSString).size(withAttributes: StatusDrawingStyles.tokenAttributes)
+        let costTextSize = (costText as NSString).size(withAttributes: StatusDrawingStyles.costAttributes)
+        let width = max(35, ceil(max(tokenTextSize.width, costTextSize.width)) + 4)
+        cachedTokenMeasureKey = key
+        cachedTokenWidth = width
+        return width
+    }
+
     private func makeStatusImage(
         cpuText: String,
         memText: String,
         upText: String,
         downText: String,
         tokenText: String,
-        costText: String
+        costText: String,
+        tokenWidth: CGFloat
     ) -> NSImage {
-        let tokenTextSize = (tokenText as NSString).size(withAttributes: StatusDrawingStyles.tokenAttributes)
-        let costTextSize = (costText as NSString).size(withAttributes: StatusDrawingStyles.costAttributes)
-        let tokenWidth = max(35, ceil(max(tokenTextSize.width, costTextSize.width)) + 4)
         let totalWidth: CGFloat = 100 + tokenWidth
         let size = NSSize(width: totalWidth, height: 22)
 
@@ -201,12 +224,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 withAttributes: StatusDrawingStyles.attributes
             )
 
-            let divider = NSBezierPath()
-            divider.move(to: NSPoint(x: dividerX, y: 3))
-            divider.line(to: NSPoint(x: dividerX, y: size.height - 3))
-            NSColor.black.withAlphaComponent(0.28).setStroke()
-            divider.lineWidth = 0.5
-            divider.stroke()
+            StatusDrawingStyles.dividerColor.setFill()
+            NSRect(x: dividerX - 0.25, y: 3, width: 0.5, height: size.height - 6).fill()
 
             (tokenText as NSString).draw(
                 in: NSRect(x: tokenX, y: 0, width: tokenWidth, height: 13),
@@ -227,18 +246,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if popover.isShown {
             popover.performClose(sender)
             popoverVisibility.isShown = false
+            metrics.isDashboardVisible = false
         } else {
+            metrics.isDashboardVisible = true
             popoverVisibility.isShown = true
             metrics.refresh()
             NSApp.activate()
             popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
             if let window = popover.contentViewController?.view.window {
-                window.isOpaque = false
-                window.backgroundColor = .clear
-                window.contentView?.wantsLayer = true
-                window.contentView?.layer?.backgroundColor = NSColor.clear.cgColor
-                popover.contentViewController?.view.wantsLayer = true
-                popover.contentViewController?.view.layer?.backgroundColor = NSColor.clear.cgColor
+                if !hasConfiguredPopoverWindow {
+                    window.isOpaque = false
+                    window.backgroundColor = .clear
+                    window.contentView?.wantsLayer = true
+                    window.contentView?.layer?.backgroundColor = NSColor.clear.cgColor
+                    popover.contentViewController?.view.wantsLayer = true
+                    popover.contentViewController?.view.layer?.backgroundColor = NSColor.clear.cgColor
+                    hasConfiguredPopoverWindow = true
+                }
                 window.makeKey()
             }
         }
@@ -251,6 +275,7 @@ private enum StatusDrawingStyles {
     static let font = NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .medium)
     static let tokenFont = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold)
     static let costFont = NSFont.monospacedDigitSystemFont(ofSize: 8.5, weight: .bold)
+    static let dividerColor = NSColor.black.withAlphaComponent(0.28)
 
     static let textStyle: NSParagraphStyle = {
         let style = NSMutableParagraphStyle()

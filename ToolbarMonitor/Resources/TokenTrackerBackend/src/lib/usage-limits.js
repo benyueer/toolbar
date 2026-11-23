@@ -510,23 +510,28 @@ async function fetchCodexUsageLimits(
     headers["ChatGPT-Account-Id"] = accountId;
   }
 
-  const startedAtMs = performance.now();
+  const startedAtMs = performance.now()
+  const initialResetCreditTimeoutMs = codexResetCreditListTimeoutMs(providerTimeoutMs)
+  // 并行发起主额度接口与重置权益列表接口请求，减少约 50% 的串行网络等待耗时
+  const resetCreditsPromise = initialResetCreditTimeoutMs > 0
+    ? fetchCodexResetCreditList(fetchImpl, headers, initialResetCreditTimeoutMs)
+    : Promise.resolve(null)
+
   const usage = await withProviderTimeout(Promise.resolve()
-    .then(() => fetchImpl("https://chatgpt.com/backend-api/wham/usage", {
-      method: "GET",
+    .then(() => fetchImpl('https://chatgpt.com/backend-api/wham/usage', {
+      method: 'GET',
       headers,
     }))
     .then(async (res) => {
-      // 401/403/404 from wham means "no usage data available for this auth state" — render
-      // a neutral empty state instead of a red "Fetch failed" error.
+      // 401/403/404 表示当前鉴权状态下无可用额度数据，返回空结构
       if (res.status === 401 || res.status === 403 || res.status === 404) {
-        return { body: null };
+        return { body: null }
       }
       if (res.status !== 200) {
-        throw new Error(`Codex API returned ${res.status}`);
+        throw new Error(`Codex API returned ${res.status}`)
       }
-      return { body: await res.json() };
-    }), "Codex", providerTimeoutMs);
+      return { body: await res.json() }
+    }), 'Codex', providerTimeoutMs)
   if (!usage.body) {
     return {
       primary_window: null,
@@ -535,23 +540,18 @@ async function fetchCodexUsageLimits(
       spark_primary_window: null,
       spark_secondary_window: null,
       reset_credits: null,
-    };
+    }
   }
-  const body = usage.body;
-  let resetCredits = normalizeCodexResetCredits(body.rate_limit_reset_credits);
-  // This semi-private sibling endpoint is read-only; /wham/usage remains the stable count fallback.
+  const body = usage.body
+  let resetCredits = normalizeCodexResetCredits(body.rate_limit_reset_credits)
   const remainingProviderBudgetMs = Number.isFinite(providerTimeoutMs) && providerTimeoutMs > 0
     ? providerTimeoutMs - (performance.now() - startedAtMs)
-    : CODEX_RESET_CREDIT_LIST_TIMEOUT_MS;
-  const resetCreditListTimeoutMs = codexResetCreditListTimeoutMs(remainingProviderBudgetMs);
+    : CODEX_RESET_CREDIT_LIST_TIMEOUT_MS
+  const resetCreditListTimeoutMs = codexResetCreditListTimeoutMs(remainingProviderBudgetMs)
   if (resetCreditListTimeoutMs > 0) {
-    const resetCreditsList = await fetchCodexResetCreditList(
-      fetchImpl,
-      headers,
-      resetCreditListTimeoutMs,
-    );
+    const resetCreditsList = await resetCreditsPromise
     if (resetCreditsList) {
-      resetCredits = resetCreditsList;
+      resetCredits = resetCreditsList
     }
   }
   return {

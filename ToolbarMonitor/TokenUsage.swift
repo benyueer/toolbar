@@ -1,7 +1,7 @@
 import Combine
 import Foundation
 
-struct TokenBreakdown: Equatable, Sendable {
+struct TokenBreakdown: Equatable, Sendable, Codable {
     var input: Int64 = 0
     var output: Int64 = 0
     var cacheRead: Int64 = 0
@@ -49,6 +49,10 @@ struct AgentTokenUsage: Identifiable, Equatable, Sendable {
     var id: String { agent }
 
     var displayName: String {
+        Self.displayName(for: agent)
+    }
+
+    static func displayName(for agent: String) -> String {
         switch agent.lowercased() {
         case "codex": "Codex"
         case "claude": "Claude Code"
@@ -153,7 +157,11 @@ struct TokenUsageSnapshot: Equatable, Sendable {
         var label: String { "内置 TokenTracker" }
     }
 
-    var days: [DailyTokenUsage] = []
+    var days: [DailyTokenUsage] = [] {
+        didSet {
+            recomputeAggregates()
+        }
+    }
     var quotaProviders: [ProviderQuotaUsage] = []
     var quotaSource: QuotaSource?
     var source: Source = .localLogs
@@ -161,20 +169,79 @@ struct TokenUsageSnapshot: Equatable, Sendable {
     var note: String?
     var generatedAt = Date()
 
+    // 预计算的常用聚合缓存，使 SwiftUI 视图层读取全部降为 O(1) 零内存分配
+    private(set) var today = TokenBreakdown()
+    private(set) var todayEstimatedCost: Double?
+    private(set) var last7Days = TokenBreakdown()
+    private(set) var last30Days = TokenBreakdown()
+    private(set) var maxDailyTokens: Int64 = 0
+    private(set) var agents1Day: [AgentTokenUsage] = []
+    private(set) var agents7Days: [AgentTokenUsage] = []
+    private(set) var agents30Days: [AgentTokenUsage] = []
+    private(set) var daysByKey: [String: DailyTokenUsage] = [:]
+
     static let empty = TokenUsageSnapshot()
 
-    var today: TokenBreakdown { totals(last: 1) }
-    var todayEstimatedCost: Double? { selectedDays(last: 1).first?.estimatedCost }
-    var last7Days: TokenBreakdown { totals(last: 7) }
-    var last30Days: TokenBreakdown { totals(last: 30) }
+    init(
+        days: [DailyTokenUsage] = [],
+        quotaProviders: [ProviderQuotaUsage] = [],
+        quotaSource: QuotaSource? = nil,
+        source: Source = .localLogs,
+        antigravitySynced: Bool = false,
+        note: String? = nil,
+        generatedAt: Date = Date()
+    ) {
+        self.days = days
+        self.quotaProviders = quotaProviders
+        self.quotaSource = quotaSource
+        self.source = source
+        self.antigravitySynced = antigravitySynced
+        self.note = note
+        self.generatedAt = generatedAt
+        recomputeAggregates()
+    }
+
+    private mutating func recomputeAggregates() {
+        today = computeTotals(last: 1)
+        todayEstimatedCost = selectedDays(last: 1).first?.estimatedCost
+        last7Days = computeTotals(last: 7)
+        last30Days = computeTotals(last: 30)
+        maxDailyTokens = days.reduce(0) { max($0, $1.tokens.total) }
+        agents1Day = selectedDays(last: 1).first?.agents ?? []
+        agents7Days = computeAgents(last: 7)
+        agents30Days = computeAgents(last: 30)
+        daysByKey = Dictionary(uniqueKeysWithValues: days.map { ($0.dateKey, $0) })
+    }
+
+    func day(forKey key: String) -> DailyTokenUsage? {
+        daysByKey[key]
+    }
 
     func totals(last count: Int) -> TokenBreakdown {
+        switch count {
+        case 1: return today
+        case 7: return last7Days
+        case 30: return last30Days
+        default: return computeTotals(last: count)
+        }
+    }
+
+    func agents(last count: Int) -> [AgentTokenUsage] {
+        switch count {
+        case 1: return agents1Day
+        case 7: return agents7Days
+        case 30: return agents30Days
+        default: return computeAgents(last: count)
+        }
+    }
+
+    private func computeTotals(last count: Int) -> TokenBreakdown {
         selectedDays(last: count).reduce(into: TokenBreakdown()) { result, day in
             result = result + day.tokens
         }
     }
 
-    func agents(last count: Int) -> [AgentTokenUsage] {
+    private func computeAgents(last count: Int) -> [AgentTokenUsage] {
         var agentTotals: [String: TokenBreakdown] = [:]
         var modelTotals: [String: [String: TokenBreakdown]] = [:]
         var costTotals: [String: Double] = [:]
@@ -230,14 +297,15 @@ final class TokenUsageMonitor: ObservableObject {
 
     init() {
         refresh(forceAntigravitySync: true, forceQuotaRefresh: true)
-        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+        let scheduledTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
                 self?.refresh()
             }
         }
-        if let timer {
-            RunLoop.main.add(timer, forMode: .common)
-        }
+        // 设置 15 秒定时器容差，允许 macOS 合并后台唤醒
+        scheduledTimer.tolerance = 15
+        RunLoop.main.add(scheduledTimer, forMode: .common)
+        self.timer = scheduledTimer
     }
 
     func refresh(forceAntigravitySync: Bool = false, forceQuotaRefresh: Bool = false) {
@@ -259,41 +327,59 @@ final class TokenUsageMonitor: ObservableObject {
         isUsageRefreshing = true
         errorMessage = nil
 
+        // 分阶段渐进式加载：本地 Token 用量（~0.3s）完成后立刻更新菜单栏与主界面，不被网络额度请求阻塞
         Task { [weak self] in
-            let result: Result<TokenUsageSnapshot, Error>
-            do {
-                let nextSnapshot = try await Task.detached(priority: .userInitiated) {
-                    try await TokenUsageCollector.collect(
-                        syncAntigravity: shouldSync,
-                        refreshQuotas: shouldRefreshQuotas,
-                        forceQuotaProviderRefresh: forceQuotaRefresh,
-                        cachedQuotas: cachedQuotas,
-                        cachedQuotaSource: cachedQuotaSource
-                    )
-                }.value
-                result = .success(nextSnapshot)
-            } catch {
-                result = .failure(error)
+            async let usageTask = Task.detached(priority: .userInitiated) {
+                await TokenUsageCollector.collectUsageOnly(syncAntigravity: shouldSync)
+            }.value
+
+            async let quotasTask = Task.detached(priority: .userInitiated) { () -> ([ProviderQuotaUsage]?, TokenUsageSnapshot.QuotaSource?) in
+                guard shouldRefreshQuotas else {
+                    return (cachedQuotas, cachedQuotaSource)
+                }
+                return TokenUsageCollector.collectQuotasOnly(forceRefresh: forceQuotaRefresh)
+            }.value
+
+            var usageSnapshot = await usageTask
+
+            if let self {
+                // 先保留已有额度缓存，立刻将最新 Token 用量与花费渲染到菜单栏和面板
+                usageSnapshot.quotaProviders = self.snapshot.quotaProviders.isEmpty ? cachedQuotas : self.snapshot.quotaProviders
+                usageSnapshot.quotaSource = self.snapshot.quotaSource ?? cachedQuotaSource
+                self.snapshot = usageSnapshot
+                self.isUsageRefreshing = false
+                self.lastUsageRefresh = Date()
+                if shouldSync, usageSnapshot.source == .embeddedCollector, usageSnapshot.antigravitySynced {
+                    self.lastAntigravitySync = Date()
+                }
+                if !shouldRefreshQuotas {
+                    self.isRefreshing = false
+                    self.isQuotaRefreshing = false
+                }
             }
 
+            guard shouldRefreshQuotas else { return }
+
+            let (fetchedQuotas, fetchedSource) = await quotasTask
             guard let self else { return }
-            isRefreshing = false
-            isQuotaRefreshing = false
-            isUsageRefreshing = false
 
-            switch result {
-            case .success(let nextSnapshot):
-                snapshot = nextSnapshot
-                lastUsageRefresh = Date()
-                if shouldSync, nextSnapshot.source == .embeddedCollector, nextSnapshot.antigravitySynced {
-                    lastAntigravitySync = Date()
-                }
-                if shouldRefreshQuotas, nextSnapshot.quotaSource == .embeddedTokenTracker {
-                    lastQuotaRefresh = Date()
-                }
-            case .failure(let error):
-                errorMessage = error.localizedDescription
+            var finalSnapshot = self.snapshot
+            if let fetchedQuotas, !fetchedQuotas.isEmpty, let fetchedSource {
+                finalSnapshot.quotaProviders = fetchedQuotas
+                finalSnapshot.quotaSource = fetchedSource
+                self.lastQuotaRefresh = Date()
+            } else {
+                finalSnapshot.quotaProviders = cachedQuotas
+                finalSnapshot.quotaSource = cachedQuotaSource
+                let quotaNote = cachedQuotas.isEmpty
+                    ? "内置 TokenTracker 额度采集器暂时不可用"
+                    : "内置 TokenTracker 额度暂时无法刷新，继续显示上次结果"
+                finalSnapshot.note = [finalSnapshot.note, quotaNote].compactMap { $0 }.joined(separator: "；")
             }
+
+            self.snapshot = finalSnapshot
+            self.isQuotaRefreshing = false
+            self.isRefreshing = false
         }
     }
 }
@@ -339,19 +425,6 @@ enum TokenUsageCollector {
         }
     }
 
-    private struct AntigravityStatus: Decodable {
-        let cacheExists: Bool
-        let sessionsDirExists: Bool
-        let manifestExists: Bool
-        let detectedConnections: Int
-        let lastSyncedAt: String?
-    }
-
-    private struct AntigravitySyncOutcome {
-        let synced: Bool
-        let note: String?
-    }
-
     private struct DayAccumulator {
         var tokens = TokenBreakdown()
         var agents: [String: TokenBreakdown] = [:]
@@ -360,7 +433,9 @@ enum TokenUsageCollector {
         var estimatedCost: Double?
     }
 
-    private static let usageCollectorStorageLock = NSLock()
+    // 排除已由本地混合解析器 100% 精准接管的 antigravity（省去扫描 44.6K 条缓存记录的 CPU 开销）及未配置会输出警告的 cursor
+    private static let embeddedGraphClientList =
+        "opencode,claude,codex,gemini,amp,droid,openclaw,pi,kimi,qwen,roocode,kilocode,mux,kilo,crush,hermes,copilot,goose,codebuff,zed,kiro,trae,synthetic"
 
     private enum CollectorError: LocalizedError {
         case invalidCollectorOutput
@@ -376,12 +451,35 @@ enum TokenUsageCollector {
         }
     }
 
-    /// 线程安全的可执行文件路径定位与缓存器（带有 TTL 保护，避免频繁启动 Shell）
+    /// 线程安全的可执行文件与资源路径定位缓存器（带有 TTL 保护，避免频繁磁盘 stat 或启动 Shell）
     private final class ExecutableLocator: @unchecked Sendable {
         static let shared = ExecutableLocator()
         private let lock = NSLock()
         private var cache: [String: (url: URL?, timestamp: Date)] = [:]
-        private let ttl: TimeInterval = 300 // 缓存 5 分钟
+        private let ttl: TimeInterval = 600 // 缓存 10 分钟
+
+        func locateFile(_ key: String, candidates: [URL], requireExecutable: Bool) -> URL? {
+            lock.lock()
+            if let cached = cache[key], Date().timeIntervalSince(cached.timestamp) < ttl {
+                let url = cached.url
+                lock.unlock()
+                return url
+            }
+            lock.unlock()
+
+            let found = candidates.first { url in
+                if requireExecutable {
+                    return FileManager.default.isExecutableFile(atPath: url.path)
+                } else {
+                    return FileManager.default.fileExists(atPath: url.path)
+                }
+            }
+
+            lock.lock()
+            cache[key] = (found, Date())
+            lock.unlock()
+            return found
+        }
 
         func locate(_ name: String, candidates: [String], shellCommand: String) -> URL? {
             lock.lock()
@@ -421,73 +519,123 @@ enum TokenUsageCollector {
         }
     }
 
-    /// 会话内部聚合记录
-    private struct NativeSessionRecord {
+    /// 会话内部聚合记录（支持 Codable 持久化到磁盘）
+    private struct NativeSessionRecord: Codable {
         let dateKey: String
         let model: String
         let tokens: TokenBreakdown
     }
 
-    /// 会话文件级别增量缓存项（基于修改时间与文件大小，防止每次遍历重复读取 5GB+ 巨量日志）
-    private struct NativeSessionCacheEntry {
-        let modificationDate: Date
+    /// 会话文件级别增量缓存项（基于修改时间戳与文件大小，防止每次遍历或应用重启后重复读取 6GB+ 巨量日志）
+    private struct NativeSessionCacheEntry: Codable {
+        let modificationTime: TimeInterval
         let fileSize: UInt64
         let records: [NativeSessionRecord]
     }
 
-    /// 线程安全的 Antigravity / Agy CLI 会话解析内存增量缓存单例
+    /// 线程安全且支持跨进程磁盘持久化的 Antigravity / Agy CLI 会话解析增量缓存单例
     private final class NativeAntigravityCache: @unchecked Sendable {
         static let shared = NativeAntigravityCache()
         private let lock = NSLock()
         private var cache: [String: NativeSessionCacheEntry] = [:]
+        private var isDirty = false
+        private let diskCacheURL: URL
+
+        private init() {
+            let appSupport = FileManager.default.urls(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask
+            ).first ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support", isDirectory: true)
+            let dir = appSupport.appendingPathComponent("ToolbarMonitor", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            self.diskCacheURL = dir.appendingPathComponent("native-session-cache-v2.json", isDirectory: false)
+
+            if let data = try? Data(contentsOf: diskCacheURL),
+               let decoded = try? JSONDecoder().decode([String: NativeSessionCacheEntry].self, from: data) {
+                self.cache = decoded
+            }
+        }
 
         func get(path: String, modificationDate: Date, fileSize: UInt64) -> [NativeSessionRecord]? {
+            let mtime = modificationDate.timeIntervalSince1970
             lock.lock()
             defer { lock.unlock() }
             guard let entry = cache[path] else { return nil }
-            if entry.modificationDate == modificationDate && entry.fileSize == fileSize {
+            if abs(entry.modificationTime - mtime) < 0.001 && entry.fileSize == fileSize {
                 return entry.records
             }
             return nil
         }
 
         func set(path: String, modificationDate: Date, fileSize: UInt64, records: [NativeSessionRecord]) {
+            let mtime = modificationDate.timeIntervalSince1970
             lock.lock()
-            defer { lock.unlock() }
             cache[path] = NativeSessionCacheEntry(
-                modificationDate: modificationDate,
+                modificationTime: mtime,
                 fileSize: fileSize,
                 records: records
             )
+            isDirty = true
+            lock.unlock()
+        }
+
+        /// 若本轮扫描有新解析或更新的会话，异步将增量缓存持久化到磁盘
+        func flushToDiskIfNeeded(activePaths: Set<String>) {
+            lock.lock()
+            guard isDirty else {
+                lock.unlock()
+                return
+            }
+            isDirty = false
+            // 清理已过期或不在活跃集合中的条目，保持磁盘缓存紧凑（通常仅几十 KB）
+            if !activePaths.isEmpty && cache.count > activePaths.count + 50 {
+                cache = cache.filter { activePaths.contains($0.key) }
+            }
+            let snapshotToSave = cache
+            lock.unlock()
+
+            let targetURL = diskCacheURL
+            DispatchQueue.global(qos: .utility).async {
+                guard let data = try? JSONEncoder().encode(snapshotToSave) else { return }
+                try? data.write(to: targetURL, options: .atomic)
+            }
         }
     }
 
-    static func collect(
-        syncAntigravity: Bool,
-        refreshQuotas: Bool = true,
-        forceQuotaProviderRefresh: Bool = false,
-        cachedQuotas: [ProviderQuotaUsage] = [],
-        cachedQuotaSource: TokenUsageSnapshot.QuotaSource? = nil
-    ) async throws -> TokenUsageSnapshot {
-        // 并行任务 1A：从内置统计引擎 / 本地日志拉取 Token 使用量
+    /// 采集并合并本地 Token 用量（不阻塞等待额度网络请求）
+    static func collectUsageOnly(syncAntigravity: Bool) async -> TokenUsageSnapshot {
+        // 并行任务 1A：从内置统计引擎拉取除 Antigravity 外的各客户端 Token 用量
         async let graphTask = Task.detached(priority: .userInitiated) { () -> TokenUsageSnapshot in
             var snapshot: TokenUsageSnapshot
             if let executable = locateEmbeddedUsageCollector() {
-                do {
-                    let antigravitySync = syncAntigravity
-                        ? synchronizeAntigravity(using: executable)
-                        : AntigravitySyncOutcome(synced: false, note: nil)
+                if syncAntigravity, shouldPerformInitialAntigravityCacheSync() {
+                    // 仅在本地旧版历史回退缓存目录尚未初始化时，在后台静默同步一次；
+                    // 新版会话均已直接从 transcript.jsonl 读取内联 Token 与 model，无需周期性启动外部进程全量同步
+                    Task.detached(priority: .utility) {
+                        _ = try? run(
+                            executable,
+                            arguments: ["antigravity", "sync"],
+                            timeout: 15
+                        )
+                    }
+                }
 
+                do {
                     let start = dayKey(for: Calendar.current.date(byAdding: .day, value: -29, to: Date()) ?? Date())
                     let data = try run(
                         executable,
-                        arguments: ["graph", "--since", start, "--no-spinner"],
-                        timeout: 35
+                        arguments: [
+                            "graph",
+                            "--since", start,
+                            "--no-spinner",
+                            "-c", embeddedGraphClientList,
+                        ],
+                        timeout: 15
                     )
                     snapshot = try parseUsageGraph(data)
                     snapshot.source = .embeddedCollector
-                    snapshot.antigravitySynced = antigravitySync.synced
-                    snapshot.note = antigravitySync.note
+                    snapshot.antigravitySynced = true
                 } catch {
                     snapshot = collectLocalLogs()
                     snapshot.note = "内置统计引擎暂时不可用，已改用本地日志统计"
@@ -499,29 +647,43 @@ enum TokenUsageCollector {
             return snapshot
         }.value
 
-        // 并行任务 1B：并发扫描原生 Antigravity 与 Agy CLI 会话日志
+        // 并行任务 1B：并发扫描原生 Antigravity 与 Agy CLI 会话日志（带内存+磁盘双层增量缓存）
         async let localAntigravityTask = Task.detached(priority: .userInitiated) { () -> TokenUsageSnapshot in
             collectLocalAntigravity()
-        }.value
-
-        // 并行任务 2：从 TokenTracker 后端异步拉取实时额度
-        async let quotasTask = Task.detached(priority: .userInitiated) { () -> ([ProviderQuotaUsage]?, TokenUsageSnapshot.QuotaSource?) in
-            guard refreshQuotas else {
-                return (cachedQuotas, cachedQuotaSource)
-            }
-            if let limitsData = try? fetchEmbeddedTokenTrackerLimits(forceRefresh: forceQuotaProviderRefresh),
-               let quotas = try? parseEmbeddedTokenTrackerLimits(limitsData),
-               !quotas.isEmpty {
-                return (quotas, .embeddedTokenTracker)
-            } else {
-                return (nil, nil)
-            }
         }.value
 
         var finalSnapshot = await graphTask
         let localSnapshot = await localAntigravityTask
         mergeAntigravityDataIfNeeded(into: &finalSnapshot, from: localSnapshot)
+        return finalSnapshot
+    }
 
+    /// 仅从内置 TokenTracker 采集已启用 Provider 的账户实时额度
+    static func collectQuotasOnly(forceRefresh: Bool) -> ([ProviderQuotaUsage]?, TokenUsageSnapshot.QuotaSource?) {
+        if let limitsData = try? fetchEmbeddedTokenTrackerLimits(forceRefresh: forceRefresh),
+           let quotas = try? parseEmbeddedTokenTrackerLimits(limitsData),
+           !quotas.isEmpty {
+            return (quotas, .embeddedTokenTracker)
+        }
+        return (nil, nil)
+    }
+
+    static func collect(
+        syncAntigravity: Bool,
+        refreshQuotas: Bool = true,
+        forceQuotaProviderRefresh: Bool = false,
+        cachedQuotas: [ProviderQuotaUsage] = [],
+        cachedQuotaSource: TokenUsageSnapshot.QuotaSource? = nil
+    ) async throws -> TokenUsageSnapshot {
+        async let usageTask = collectUsageOnly(syncAntigravity: syncAntigravity)
+        async let quotasTask = Task.detached(priority: .userInitiated) { () -> ([ProviderQuotaUsage]?, TokenUsageSnapshot.QuotaSource?) in
+            guard refreshQuotas else {
+                return (cachedQuotas, cachedQuotaSource)
+            }
+            return collectQuotasOnly(forceRefresh: forceQuotaProviderRefresh)
+        }.value
+
+        var finalSnapshot = await usageTask
         let (fetchedQuotas, fetchedSource) = await quotasTask
 
         if let fetchedQuotas, !fetchedQuotas.isEmpty, let fetchedSource {
@@ -547,11 +709,11 @@ enum TokenUsageCollector {
         var totalCost: Double = 0
         let agentKey = agent.agent.lowercased()
         let isAntigravityFamily = agentKey == "antigravity" || agentKey == "agy-cli" || agentKey == "gemini"
+        let million: Double = 1_000_000
 
         for model in agent.models {
             let tokens = model.tokens
             let name = model.name.lowercased()
-            let million: Double = 1_000_000
 
             let inputRate: Double
             let outputRate: Double
@@ -567,7 +729,7 @@ enum TokenUsageCollector {
                 } else if name.contains("haiku") {
                     (inputRate, outputRate, cacheRate) = (0.80, 4.00, 0.08)
                 } else {
-                    // Gemini Flash (3.8 / 3.7 / 3.0 等)
+                    // Gemini Flash (3.8 / 3.7 / 3.0 等) 及默认费率
                     (inputRate, outputRate, cacheRate) = (0.15, 0.60, 0.0375)
                 }
             } else if agentKey.contains("claude") {
@@ -581,13 +743,10 @@ enum TokenUsageCollector {
             } else {
                 // Codex / OpenAI / Cursor 族
                 if name.contains("luna") || name.contains("mini") || name.contains("nano") || name.contains("flash") {
-                    // 轻量级高频模型（如 gpt-6-luna, gpt-4o-mini 等，缓存读取折扣极高）
                     (inputRate, outputRate, cacheRate) = (0.15, 0.60, 0.008)
                 } else if name.contains("sol") || name.contains("gpt-6") || name.contains("gpt-5") || name.contains("o1") || name.contains("o3") {
-                    // 旗舰级前沿模型（如 gpt-6-sol, gpt-5, o1, o3 等）
                     (inputRate, outputRate, cacheRate) = (2.00, 8.00, 0.25)
                 } else {
-                    // 其它标准模型默认费率
                     (inputRate, outputRate, cacheRate) = (2.50, 10.00, 0.25)
                 }
             }
@@ -600,18 +759,12 @@ enum TokenUsageCollector {
         return totalCost
     }
 
-    /// 校准快照中的 Antigravity 与 Agy CLI 用量。
-    /// 核心逻辑：
-    /// 底层 `usage-collector` 的 `antigravity-cache` 中绝大部分会话单步 `timestamp` 为 `null`，
-    /// 会把跨天长会话（如横跨 10月19日-22日 的数亿 Token 会话）按文件 `lastModifiedMs` 全部堆叠到最后修改日，
-    /// 导致历史某一天暴涨（如 10月22日 虚高至 708.9M）、而实际发生消耗的前几天被掏空。
-    /// 本地混合解析器（`transcript.jsonl` 精确单步 `created_at` 时间戳 + 原生/缓存单步精确 Token 明细）
-    /// 能够在全部 30 天维度按每一步真实发生日期精准切分归集，因此全量 30 天均以本地混合解析结果为准。
+    /// 校准快照中的 Antigravity 与 Agy CLI 用量
     private static func mergeAntigravityDataIfNeeded(
         into snapshot: inout TokenUsageSnapshot,
         from localSnapshot: TokenUsageSnapshot
     ) {
-        var daysMap = Dictionary(uniqueKeysWithValues: snapshot.days.map { ($0.dateKey, $0) })
+        var daysMap = snapshot.daysByKey
         let targetAgents = ["antigravity", "agy-cli"]
 
         var allKeys = Set(daysMap.keys)
@@ -619,7 +772,7 @@ enum TokenUsageCollector {
             allKeys.insert(localDay.dateKey)
         }
 
-        let localDaysMap = Dictionary(uniqueKeysWithValues: localSnapshot.days.map { ($0.dateKey, $0) })
+        let localDaysMap = localSnapshot.daysByKey
 
         for key in allKeys {
             var dayUsage = daysMap[key] ?? DailyTokenUsage(
@@ -647,22 +800,16 @@ enum TokenUsageCollector {
                     }
                     dayChanged = true
                 } else if let existingIndex {
-                    // 该日原生精确时间戳下无此 Agent 消耗，剔除底层因跨天会话 lastModifiedMs 漂移堆叠过来的虚高数据
                     agents.remove(at: existingIndex)
                     dayChanged = true
                 }
             }
 
             if dayChanged {
-                // 基于最新 agents 重新精确加总当日总 Token
                 var recalculatedTokens = TokenBreakdown()
-                for ag in agents {
-                    recalculatedTokens = recalculatedTokens + ag.tokens
-                }
-
-                // 重新核算当日预估费用
                 var recomputedCost: Double = 0
                 for ag in agents {
+                    recalculatedTokens = recalculatedTokens + ag.tokens
                     if let exact = ag.estimatedCost, exact > 0 {
                         recomputedCost += exact
                     } else {
@@ -680,10 +827,11 @@ enum TokenUsageCollector {
             }
         }
 
-        // 严格保证按照 30 天日期窗口对齐输出，保证柱状图 30 天每一个点位置完全对应
+        // 严格保证按照 30 天日期窗口对齐输出
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: Date())
         var resultDays: [DailyTokenUsage] = []
+        resultDays.reserveCapacity(30)
         for offset in (-29)...0 {
             guard let date = calendar.date(byAdding: .day, value: offset, to: today) else { continue }
             let key = dayKey(for: date)
@@ -934,6 +1082,18 @@ enum TokenUsageCollector {
         return applyQuotaProviderPreferences(to: providers)
     }
 
+    /// 获取用户当前配置为可见的额度 Provider ID 列表，仅向这些平台发起额度探测
+    private static func configuredVisibleQuotaProviderIds() -> [String] {
+        let defaults = UserDefaults.standard
+        let defaultVisible = ["codex", "antigravity", "opencodeGo"]
+        guard let visibility = defaults.dictionary(forKey: "QuotaProviderVisibility") else {
+            return defaultVisible
+        }
+        let allKnown = ["claude", "codex", "cursor", "kimi", "gemini", "kiro", "antigravity", "copilot", "grok", "zcode", "opencodeGo"]
+        let enabled = allKnown.filter { (visibility[$0] as? Bool) ?? true }
+        return enabled.isEmpty ? defaultVisible : enabled
+    }
+
     private static func applyQuotaProviderPreferences(
         to providers: [ProviderQuotaUsage]
     ) -> [ProviderQuotaUsage] {
@@ -958,7 +1118,8 @@ enum TokenUsageCollector {
         guard let runner = locateTokenTrackerQuotaRunner(), let node = locateNode() else {
             throw CollectorError.processFailed("内置 TokenTracker")
         }
-        var arguments = [runner.path]
+        let targetProviders = configuredVisibleQuotaProviderIds().joined(separator: ",")
+        var arguments = [runner.path, "--providers", targetProviders]
         if forceRefresh { arguments.append("--refresh") }
         return try run(node, arguments: arguments)
     }
@@ -969,7 +1130,11 @@ enum TokenUsageCollector {
             Bundle.main.resourceURL?.appendingPathComponent("TokenTrackerBackend/quota-runner.js"),
             sourceDirectory.appendingPathComponent("Resources/TokenTrackerBackend/quota-runner.js"),
         ].compactMap { $0 }
-        return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
+        return ExecutableLocator.shared.locateFile(
+            "quota-runner.js",
+            candidates: candidates,
+            requireExecutable: false
+        )
     }
 
     private static func locateNode() -> URL? {
@@ -1014,7 +1179,6 @@ enum TokenUsageCollector {
             into: &accumulators
         )
 
-        // 扫描原生的 Antigravity 与 Agy CLI 会话日志（内部已结合 antigravity-cache 补齐旧日志明细）
         parseNativeAntigravityAndAgy(
             earliestDate: earliestDate,
             into: &accumulators
@@ -1027,7 +1191,6 @@ enum TokenUsageCollector {
         var accumulators: [String: DayAccumulator] = [:]
         let earliestDate = Calendar.current.date(byAdding: .day, value: -31, to: Date()) ?? Date()
 
-        // 仅扫描原生的 Antigravity 与 Agy CLI 会话日志（带有绝对权威的精确 step created_at 时间戳）
         parseNativeAntigravityAndAgy(
             earliestDate: earliestDate,
             into: &accumulators
@@ -1052,10 +1215,9 @@ enum TokenUsageCollector {
             var sessionID = file.deletingPathExtension().lastPathComponent
 
             for line in lines {
-                guard
-                    let data = String(line).data(using: .utf8),
-                    let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                else { continue }
+                guard let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else {
+                    continue
+                }
 
                 let type = object["type"] as? String
                 let payload = object["payload"] as? [String: Any]
@@ -1114,8 +1276,7 @@ enum TokenUsageCollector {
 
             for line in lines where line.contains("\"usage\"") {
                 guard
-                    let data = String(line).data(using: .utf8),
-                    let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                    let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
                     let message = object["message"] as? [String: Any],
                     let usage = (message["usage"] ?? object["usage"]) as? [String: Any],
                     let timestamp = object["timestamp"] as? String,
@@ -1149,7 +1310,7 @@ enum TokenUsageCollector {
     ) {
         for file in recentFiles(at: root, extension: "json", since: earliestDate) {
             guard
-                let data = try? Data(contentsOf: file),
+                let data = try? Data(contentsOf: file, options: .mappedIfSafe),
                 let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                 let messages = object["messages"] as? [[String: Any]]
             else { continue }
@@ -1185,60 +1346,12 @@ enum TokenUsageCollector {
         }
     }
 
-    private static func parseAntigravityCache(
-        root: URL,
-        earliestDate: Date,
-        into accumulators: inout [String: DayAccumulator]
-    ) {
-        var seenResponses = Set<String>()
-        for file in recentFiles(at: root, extension: "jsonl", since: earliestDate) {
-            guard let lines = try? String(contentsOf: file, encoding: .utf8).split(whereSeparator: \.isNewline) else {
-                continue
-            }
-
-            var fallbackModel = "unknown"
-            for line in lines {
-                guard
-                    let data = String(line).data(using: .utf8),
-                    let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                else { continue }
-
-                if object["type"] as? String == "session_meta" {
-                    fallbackModel = (object["modelId"] as? String) ?? fallbackModel
-                    continue
-                }
-                guard object["type"] as? String == "usage" else { continue }
-
-                if let responseID = object["responseId"] as? String,
-                   !seenResponses.insert(responseID).inserted {
-                    continue
-                }
-
-                let timestamp = number(object["timestamp"])
-                guard timestamp > 0 else { continue }
-                let date = Date(timeIntervalSince1970: Double(timestamp) / 1_000)
-                guard date >= earliestDate else { continue }
-
-                let tokens = TokenBreakdown(
-                    input: number(object["input"]),
-                    output: number(object["output"]),
-                    cacheRead: number(object["cacheRead"]),
-                    cacheWrite: number(object["cacheWrite"]),
-                    reasoning: number(object["reasoning"])
-                )
-                guard tokens.total > 0 else { continue }
-                let model = (object["modelId"] as? String) ?? fallbackModel
-                record(tokens, agent: "antigravity", model: model, date: date, into: &accumulators)
-            }
-        }
-    }
-
     private struct CachedAntigravityStepUsage {
         let modelId: String?
         let tokens: TokenBreakdown
     }
 
-    /// 构建 sessionId -> antigravity-cache 会话文件路径的索引，用于补齐旧版（10月11日前）transcript.jsonl 缺失的精确 Token 明细
+    /// 构建 sessionId -> antigravity-cache 会话文件路径的索引
     private static func buildAntigravityCacheIndex() -> [String: URL] {
         let sessionsRoot = prepareUsageCollectorStorage().appendingPathComponent("antigravity-cache/sessions", isDirectory: true)
         guard let files = try? FileManager.default.contentsOfDirectory(
@@ -1248,6 +1361,7 @@ enum TokenUsageCollector {
         ) else { return [:] }
 
         var index: [String: URL] = [:]
+        index.reserveCapacity(files.count)
         for file in files where file.pathExtension.lowercased() == "jsonl" {
             let name = file.deletingPathExtension().lastPathComponent
             guard name.count >= 36 else { continue }
@@ -1266,9 +1380,9 @@ enum TokenUsageCollector {
         var usages: [CachedAntigravityStepUsage] = []
         var fallbackModel: String?
         for line in content.split(whereSeparator: \.isNewline) {
-            guard let data = String(line).data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { continue }
+            guard let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else {
+                continue
+            }
 
             let type = object["type"] as? String
             if type == "session_meta" {
@@ -1292,9 +1406,12 @@ enum TokenUsageCollector {
         return usages
     }
 
-    /// 直接解析本机 ~/.gemini/ 目录下 Antigravity IDE 和 Agy CLI 原生会话日志，
-    /// 并结合 antigravity-cache 单步明细实现全量 30 天按每一步真实 created_at 时间戳精准切分。
-    /// 具备基于 (mtime, fileSize) 的轻量内存增量缓存，避免每次刷新重复读取 5GB+ 巨量日志并飙满 CPU。
+    private static let plannerResponseMarker = Data("\"PLANNER_RESPONSE\"".utf8)
+    private static let modelSelectionMarker = Data("Model Selection".utf8)
+    private static let userInputMarker = Data("\"USER_INPUT\"".utf8)
+
+    /// 直接解析本机 ~/.gemini/ 目录下 Antigravity IDE 和 Agy CLI 原生会话日志。
+    /// 采用 mmap 零拷贝字节流扫描 + 内存与磁盘双层增量缓存，避免重复读取 6GB+ 巨量日志。
     private static func parseNativeAntigravityAndAgy(
         earliestDate: Date,
         into accumulators: inout [String: DayAccumulator]
@@ -1311,6 +1428,7 @@ enum TokenUsageCollector {
         let fileManager = FileManager.default
         let earliestDayKey = dayKey(for: earliestDate)
         var lazyCacheIndex: [String: URL]? = nil
+        var activePaths = Set<String>()
 
         for target in targets {
             guard fileManager.fileExists(atPath: target.dir.path) else { continue }
@@ -1335,35 +1453,44 @@ enum TokenUsageCollector {
                 else { continue }
 
                 let filePath = transcriptFile.path
+                activePaths.insert(filePath)
 
-                // 优先从内存增量缓存中获取该会话已聚合的记录
+                // 优先从内存/磁盘增量缓存中 O(1) 获取该会话已聚合的记录
                 if let cachedRecords = NativeAntigravityCache.shared.get(
                     path: filePath,
                     modificationDate: mtime,
                     fileSize: UInt64(size)
                 ) {
-                    for rec in cachedRecords {
-                        if rec.dateKey >= earliestDayKey {
-                            record(rec.tokens, agent: target.agent, model: rec.model, dateKey: rec.dateKey, into: &accumulators)
-                        }
+                    for rec in cachedRecords where rec.dateKey >= earliestDayKey {
+                        record(rec.tokens, agent: target.agent, model: rec.model, dateKey: rec.dateKey, into: &accumulators)
                     }
                     continue
                 }
 
-                guard let content = try? String(contentsOf: transcriptFile, encoding: .utf8) else { continue }
-                let lines = content.split(whereSeparator: \.isNewline)
+                // 使用 mmap 内存映射零拷贝读取新增或变更的会话文件
+                guard let fileData = try? Data(contentsOf: transcriptFile, options: .mappedIfSafe),
+                      !fileData.isEmpty
+                else { continue }
 
                 var cachedUsages: [CachedAntigravityStepUsage]?
                 var currentModel: String?
                 var plannerStepIndex = 0
-
-                // 用于缓存当前会话按 (dateKey, model) 聚合的结果
                 var sessionTokens: [String: [String: TokenBreakdown]] = [:]
 
-                for line in lines {
-                    if line.contains("Model Selection") && line.contains("USER_INPUT") {
-                        if let data = String(line).data(using: .utf8),
-                           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let newlineByte = UInt8(ascii: "\n")
+                var lineStart = fileData.startIndex
+                let endIndex = fileData.endIndex
+
+                while lineStart < endIndex {
+                    let lineEnd = fileData[lineStart..<endIndex].firstIndex(of: newlineByte) ?? endIndex
+                    let lineData = fileData[lineStart..<lineEnd]
+                    lineStart = lineEnd < endIndex ? lineEnd + 1 : endIndex
+
+                    guard !lineData.isEmpty else { continue }
+
+                    // 快速字节子串过滤：仅对包含目标标记的行执行 JSON 反序列化
+                    if lineData.range(of: modelSelectionMarker) != nil && lineData.range(of: userInputMarker) != nil {
+                        if let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
                            object["type"] as? String == "USER_INPUT",
                            let textContent = object["content"] as? String,
                            let match = extractModelSelection(from: textContent) {
@@ -1371,9 +1498,8 @@ enum TokenUsageCollector {
                         }
                     }
 
-                    guard line.contains("\"PLANNER_RESPONSE\""),
-                          let data = String(line).data(using: .utf8),
-                          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                    guard lineData.range(of: plannerResponseMarker) != nil,
+                          let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
                           object["type"] as? String == "PLANNER_RESPONSE"
                     else { continue }
 
@@ -1389,10 +1515,15 @@ enum TokenUsageCollector {
                     let cacheRead = number(object["cache_read_tokens"])
                     let cacheWrite = number(object["cache_write_tokens"])
 
-                    let thinking = object["thinking"] as? String ?? ""
-                    let reasoningTokens = number(object["reasoning_tokens"]) > 0
-                        ? number(object["reasoning_tokens"])
-                        : Int64(thinking.count / 3)
+                    let inlineReasoning = number(object["reasoning_tokens"])
+                    let reasoningTokens: Int64
+                    if inlineReasoning > 0 {
+                        reasoningTokens = inlineReasoning
+                    } else if let thinking = object["thinking"] as? String, !thinking.isEmpty {
+                        reasoningTokens = Int64(thinking.count / 3)
+                    } else {
+                        reasoningTokens = 0
+                    }
 
                     var tokens = TokenBreakdown(
                         input: inputTokens,
@@ -1402,11 +1533,17 @@ enum TokenUsageCollector {
                         reasoning: reasoningTokens
                     )
 
-                    var stepModel = currentModel
+                    // 优先读取 PLANNER_RESPONSE 内联的 model 字段，其次使用会话切换的模型名
+                    var stepModel: String?
+                    if let inlineModel = object["model"] as? String, !inlineModel.isEmpty {
+                        let normalized = normalizeAntigravityModel(inlineModel)
+                        stepModel = normalized
+                        currentModel = normalized
+                    } else {
+                        stepModel = currentModel
+                    }
 
                     if inputTokens == 0 && outputTokens == 0 && cacheRead == 0 {
-                        // 旧版日志（如 10月11日前）transcript.jsonl 未内联写入 input_tokens，
-                        // 从 antigravity-cache 对应会话的同序 step 读取精确 Token 明细
                         if cachedUsages == nil {
                             if lazyCacheIndex == nil {
                                 lazyCacheIndex = buildAntigravityCacheIndex()
@@ -1424,16 +1561,9 @@ enum TokenUsageCollector {
                         }
 
                         if tokens.total == 0 {
-                            // 若缓存中也无记录，再用字符数估算兜底
                             let contentStr = object["content"] as? String ?? ""
-                            let toolCalls = object["tool_calls"]
-                            let toolCallsCount: Int
-                            if let toolCalls = toolCalls as? [Any] {
-                                toolCallsCount = toolCalls.count * 150
-                            } else {
-                                toolCallsCount = 0
-                            }
-                            let estOutput = Int64((contentStr.count + toolCallsCount) / 3)
+                            let toolCallsCount = (object["tool_calls"] as? [Any])?.count ?? 0
+                            let estOutput = Int64((contentStr.count + toolCallsCount * 150) / 3)
                             tokens = TokenBreakdown(
                                 input: 1000,
                                 output: estOutput,
@@ -1463,7 +1593,6 @@ enum TokenUsageCollector {
                     }
                 }
 
-                // 将该会话聚合结果写入缓存，并记录到全局累加器
                 var sessionRecords: [NativeSessionRecord] = []
                 for (dKey, models) in sessionTokens {
                     for (mName, tok) in models {
@@ -1481,6 +1610,8 @@ enum TokenUsageCollector {
                 )
             }
         }
+
+        NativeAntigravityCache.shared.flushToDiskIfNeeded(activePaths: activePaths)
     }
 
     /// 从日志上下文字符串中提取切换的模型名
@@ -1526,7 +1657,6 @@ enum TokenUsageCollector {
         if lower.contains("opus") { return "claude-opus-4-6" }
         if lower.contains("haiku") { return "claude-haiku-4-5" }
 
-        // 通用规范化：去除括号档位（如 "(Medium)", "(High)", "(Thinking)"），转为小写连字符格式
         var cleaned = lower
         if let parenIndex = cleaned.firstIndex(of: "(") {
             cleaned = String(cleaned[..<parenIndex])
@@ -1583,6 +1713,7 @@ enum TokenUsageCollector {
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: Date())
         var days: [DailyTokenUsage] = []
+        days.reserveCapacity(30)
 
         for offset in (-29)...0 {
             guard let date = calendar.date(byAdding: .day, value: offset, to: today) else { continue }
@@ -1643,7 +1774,6 @@ enum TokenUsageCollector {
             guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey]) else {
                 continue
             }
-            // 过滤非普通文件、修改时间过早的文件以及超过大小限制（默认 10MB）的大日志
             guard values.isRegularFile == true,
                   (values.contentModificationDate ?? .distantPast) >= date,
                   Int64(values.fileSize ?? 0) <= maxSizeBytes
@@ -1661,9 +1791,11 @@ enum TokenUsageCollector {
             Bundle.main.resourceURL?.appendingPathComponent("UsageCollectorBackend/usage-collector"),
             sourceDirectory.appendingPathComponent("Resources/UsageCollectorBackend/usage-collector"),
         ].compactMap { $0 }
-        return candidates.first {
-            FileManager.default.isExecutableFile(atPath: $0.path)
-        }
+        return ExecutableLocator.shared.locateFile(
+            "usage-collector",
+            candidates: candidates,
+            requireExecutable: true
+        )
     }
 
     private static func usageCollectorConfigDirectory() -> URL {
@@ -1677,11 +1809,8 @@ enum TokenUsageCollector {
             .appendingPathComponent("UsageCollector", isDirectory: true)
     }
 
-    /// 首次升级时只复制仍有价值的本地缓存，后续全部写入 ToolbarMonitor 自己的目录。
-    private static func prepareUsageCollectorStorage() -> URL {
-        usageCollectorStorageLock.lock()
-        defer { usageCollectorStorageLock.unlock() }
-
+    /// 利用 Swift static let 原生线程安全懒加载（dispatch_once），整个进程生命周期仅初始化一次存储目录
+    private static let preparedStorageURL: URL = {
         let fileManager = FileManager.default
         let destinationRoot = usageCollectorConfigDirectory()
         try? fileManager.createDirectory(
@@ -1701,6 +1830,17 @@ enum TokenUsageCollector {
         }
 
         return destinationRoot
+    }()
+
+    private static func prepareUsageCollectorStorage() -> URL {
+        preparedStorageURL
+    }
+
+    /// 检查是否需要执行首次 antigravity-cache 回退缓存初始化
+    private static func shouldPerformInitialAntigravityCacheSync() -> Bool {
+        let manifestURL = prepareUsageCollectorStorage()
+            .appendingPathComponent("antigravity-cache/manifest.json", isDirectory: false)
+        return !FileManager.default.fileExists(atPath: manifestURL.path)
     }
 
     @discardableResult
@@ -1717,7 +1857,9 @@ enum TokenUsageCollector {
         environment["NODE_USE_ENV_PROXY"] = "1"
         if executable.lastPathComponent == "usage-collector" {
             environment["TOKSCALE_CONFIG_DIR"] = prepareUsageCollectorStorage().path
-            environment["TOKSCALE_NATIVE_TIMEOUT_MS"] = "45000"
+            environment["TOKSCALE_NATIVE_TIMEOUT_MS"] = "15000"
+            // 强制使用本地定价缓存，防止在弱网环境下每次请求 GitHub LiteLLM JSON 失败重试卡死 30+ 秒
+            environment["TOKSCALE_PRICING_CACHE_ONLY"] = "yes"
         }
         process.environment = environment
 
@@ -1746,105 +1888,6 @@ enum TokenUsageCollector {
         if let number = value as? NSNumber { return max(0, number.int64Value) }
         if let text = value as? String, let number = Int64(text) { return max(0, number) }
         return 0
-    }
-
-    private static func synchronizeAntigravity(using executable: URL) -> AntigravitySyncOutcome {
-        var latestStatus = try? readAntigravityStatus(using: executable)
-        var expectedConnections = latestStatus?.detectedConnections ?? 0
-        var synchronizedConnections = 0
-        var completedSync = false
-
-        // 若当前未检测到活跃连接，新版直接依托本地日志，无需启动外部进程空转消耗性能
-        if expectedConnections == 0 {
-            return AntigravitySyncOutcome(synced: true, note: nil)
-        }
-
-        // Antigravity 的全局与工作区 language server 可能分两轮才被发现。
-        // 每轮 sync 后重新读取 status；仅当 status 看到了尚未同步的连接时再补一次。
-        for attempt in 1...2 {
-            do {
-                let output = try run(
-                    executable,
-                    arguments: ["antigravity", "sync"],
-                    timeout: 10
-                )
-                completedSync = true
-                synchronizedConnections = max(
-                    synchronizedConnections,
-                    antigravityConnectionCount(in: output) ?? 0
-                )
-            } catch {
-                if attempt == 2 {
-                    break
-                }
-                continue
-            }
-
-            if let status = try? readAntigravityStatus(using: executable) {
-                latestStatus = status
-                expectedConnections = max(expectedConnections, status.detectedConnections)
-            }
-
-            if synchronizedConnections >= expectedConnections {
-                break
-            }
-        }
-
-        guard completedSync else {
-            return AntigravitySyncOutcome(
-                synced: false,
-                note: nil
-            )
-        }
-
-        let visibleConnections = max(expectedConnections, latestStatus?.detectedConnections ?? 0)
-        guard visibleConnections > 0 else {
-            // 新版 Antigravity (2.25+) 已将每次调用的精确 Token 直接写入本地 transcript.jsonl，
-            // 且进程名由 language_server_macos_arm 改为 language_server，无需再提示旧版语言服务未检测到。
-            return AntigravitySyncOutcome(
-                synced: true,
-                note: nil
-            )
-        }
-
-        guard synchronizedConnections >= visibleConnections else {
-            return AntigravitySyncOutcome(
-                synced: false,
-                note: nil
-            )
-        }
-
-        if let status = latestStatus,
-           !status.cacheExists || !status.sessionsDirExists || !status.manifestExists || status.lastSyncedAt == nil {
-            return AntigravitySyncOutcome(
-                synced: false,
-                note: nil
-            )
-        }
-
-        return AntigravitySyncOutcome(synced: true, note: nil)
-    }
-
-    private static func readAntigravityStatus(using executable: URL) throws -> AntigravityStatus {
-        let data = try run(
-            executable,
-            arguments: ["antigravity", "status", "--json"],
-            timeout: 15
-        )
-        return try JSONDecoder().decode(AntigravityStatus.self, from: data)
-    }
-
-    private static func antigravityConnectionCount(in output: Data) -> Int? {
-        guard let text = String(data: output, encoding: .utf8) else { return nil }
-        for line in text.split(whereSeparator: \.isNewline) {
-            let parts = line.split(separator: ":", maxSplits: 1)
-            guard
-                parts.count == 2,
-                parts[0].trimmingCharacters(in: .whitespacesAndNewlines) == "detected connections"
-            else { continue }
-            return Int(parts[1].trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        return nil
     }
 
     private final class DateFormatters: @unchecked Sendable {
@@ -1886,26 +1929,39 @@ enum TokenUsageCollector {
         DateFormatters.shared.dayKey(for: date)
     }
 
-    /// 极速从 ISO8601 时间戳中提取 "yyyy-MM-dd"，纳秒级无分配，避免实例化 DateFormatter
+    /// 极速从 ISO8601 时间戳中提取 "yyyy-MM-dd"，纳秒级无分配
     private static func extractDayKey(from timestamp: String) -> String? {
-        guard timestamp.count >= 10 else { return nil }
+        guard timestamp.utf8.count >= 10 else { return nil }
         let prefix = timestamp.prefix(10)
-        let utf8 = Array(prefix.utf8)
-        guard utf8.count == 10,
-              utf8[0] >= 48 && utf8[0] <= 57,
-              utf8[1] >= 48 && utf8[1] <= 57,
-              utf8[2] >= 48 && utf8[2] <= 57,
-              utf8[3] >= 48 && utf8[3] <= 57,
-              utf8[4] == UInt8(ascii: "-"),
-              utf8[5] >= 48 && utf8[5] <= 57,
-              utf8[6] >= 48 && utf8[6] <= 57,
-              utf8[7] == UInt8(ascii: "-"),
-              utf8[8] >= 48 && utf8[8] <= 57,
-              utf8[9] >= 48 && utf8[9] <= 57
-        else { return nil }
+        var index = prefix.utf8.startIndex
+        for pos in 0..<10 {
+            let byte = prefix.utf8[index]
+            if pos == 4 || pos == 7 {
+                guard byte == UInt8(ascii: "-") else { return nil }
+            } else {
+                guard byte >= 48 && byte <= 57 else { return nil }
+            }
+            prefix.utf8.formIndex(after: &index)
+        }
         return String(prefix)
     }
+}
 
+/// 线程安全的共享十进制数字格式化器，避免每次调用 formattedWithSeparators 都实例化 NumberFormatter
+private final class SharedDecimalNumberFormatter: @unchecked Sendable {
+    static let shared = SharedDecimalNumberFormatter()
+    private let lock = NSLock()
+    private let formatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter
+    }()
+
+    func string(from value: Int64) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+    }
 }
 
 extension Int64 {
@@ -1924,9 +1980,7 @@ extension Int64 {
     }
 
     var formattedWithSeparators: String {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        return formatter.string(from: NSNumber(value: self)) ?? "\(self)"
+        SharedDecimalNumberFormatter.shared.string(from: self)
     }
 }
 
