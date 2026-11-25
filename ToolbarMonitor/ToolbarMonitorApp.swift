@@ -54,7 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.behavior = .transient
         popover.animates = true
         popover.delegate = self
-        popover.contentSize = NSSize(width: 420, height: 680)
+        popover.contentSize = NSSize(width: 432, height: 696)
         popover.contentViewController = NSHostingController(
             rootView: SystemDetailsView(
                 metrics: metrics,
@@ -243,6 +243,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     @objc
     private func togglePopover(_ sender: NSStatusBarButton) {
+        if let event = NSApp.currentEvent,
+           event.type == .rightMouseUp || (event.type == .leftMouseUp && event.modifierFlags.contains(.control)) {
+            showStatusContextMenu(from: sender)
+            return
+        }
+        togglePopoverPanel(from: sender)
+    }
+
+    private func togglePopoverPanel(from sender: NSStatusBarButton) {
         if popover.isShown {
             popover.performClose(sender)
             popoverVisibility.isShown = false
@@ -266,6 +275,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 window.makeKey()
             }
         }
+    }
+
+    /// 菜单栏右键快捷菜单：支持直接刷新额度/用量、切换弹窗与退出
+    private func showStatusContextMenu(from sender: NSStatusBarButton) {
+        let menu = NSMenu()
+        let toggleTitle = popover.isShown ? "收起详情面板" : "打开详情面板"
+        let toggleItem = NSMenuItem(title: toggleTitle, action: #selector(handleMenuTogglePopover), keyEquivalent: "")
+        toggleItem.target = self
+        menu.addItem(toggleItem)
+
+        let refreshItem = NSMenuItem(title: "立即刷新用量与额度", action: #selector(handleMenuRefresh), keyEquivalent: "r")
+        refreshItem.target = self
+        refreshItem.isEnabled = !tokenUsage.isRefreshing
+        menu.addItem(refreshItem)
+
+        menu.addItem(.separator())
+
+        let quitItem = NSMenuItem(title: "退出 ToolbarMonitor", action: #selector(handleMenuQuit), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+
+        statusItem?.menu = menu
+        sender.performClick(nil)
+        statusItem?.menu = nil
+    }
+
+    @objc
+    private func handleMenuTogglePopover() {
+        guard let button = statusItem?.button else { return }
+        togglePopoverPanel(from: button)
+    }
+
+    @objc
+    private func handleMenuRefresh() {
+        metrics.refresh()
+        tokenUsage.refresh(forceAntigravitySync: false, forceQuotaRefresh: true)
+    }
+
+    @objc
+    private func handleMenuQuit() {
+        NSApp.terminate(nil)
     }
 }
 

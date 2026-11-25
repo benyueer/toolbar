@@ -118,6 +118,24 @@ struct ProviderQuotaUsage: Identifiable, Equatable, Sendable {
     let provider: String
     let plan: String?
     let windows: [QuotaWindowUsage]
+    let isCached: Bool
+    let cachedAt: Date?
+
+    init(
+        id: String,
+        provider: String,
+        plan: String? = nil,
+        windows: [QuotaWindowUsage],
+        isCached: Bool = false,
+        cachedAt: Date? = nil
+    ) {
+        self.id = id
+        self.provider = provider
+        self.plan = plan
+        self.windows = windows
+        self.isCached = isCached
+        self.cachedAt = cachedAt
+    }
 
     var canonicalAgent: String {
         let key = provider.lowercased()
@@ -173,7 +191,9 @@ struct TokenUsageSnapshot: Equatable, Sendable {
     private(set) var today = TokenBreakdown()
     private(set) var todayEstimatedCost: Double?
     private(set) var last7Days = TokenBreakdown()
+    private(set) var last7DaysEstimatedCost: Double?
     private(set) var last30Days = TokenBreakdown()
+    private(set) var last30DaysEstimatedCost: Double?
     private(set) var maxDailyTokens: Int64 = 0
     private(set) var agents1Day: [AgentTokenUsage] = []
     private(set) var agents7Days: [AgentTokenUsage] = []
@@ -205,12 +225,20 @@ struct TokenUsageSnapshot: Equatable, Sendable {
         today = computeTotals(last: 1)
         todayEstimatedCost = selectedDays(last: 1).first?.estimatedCost
         last7Days = computeTotals(last: 7)
+        last7DaysEstimatedCost = computeEstimatedCost(last: 7)
         last30Days = computeTotals(last: 30)
+        last30DaysEstimatedCost = computeEstimatedCost(last: 30)
         maxDailyTokens = days.reduce(0) { max($0, $1.tokens.total) }
         agents1Day = selectedDays(last: 1).first?.agents ?? []
         agents7Days = computeAgents(last: 7)
         agents30Days = computeAgents(last: 30)
         daysByKey = Dictionary(uniqueKeysWithValues: days.map { ($0.dateKey, $0) })
+    }
+
+    private func computeEstimatedCost(last count: Int) -> Double? {
+        let costs = selectedDays(last: count).compactMap(\.estimatedCost)
+        guard !costs.isEmpty else { return nil }
+        return costs.reduce(0, +)
     }
 
     func day(forKey key: String) -> DailyTokenUsage? {
@@ -223,6 +251,15 @@ struct TokenUsageSnapshot: Equatable, Sendable {
         case 7: return last7Days
         case 30: return last30Days
         default: return computeTotals(last: count)
+        }
+    }
+
+    func estimatedCost(last count: Int) -> Double? {
+        switch count {
+        case 1: return todayEstimatedCost
+        case 7: return last7DaysEstimatedCost
+        case 30: return last30DaysEstimatedCost
+        default: return computeEstimatedCost(last: count)
         }
     }
 
@@ -605,6 +642,9 @@ enum TokenUsageCollector {
 
     /// 采集并合并本地 Token 用量（不阻塞等待额度网络请求）
     static func collectUsageOnly(syncAntigravity: Bool) async -> TokenUsageSnapshot {
+        // 在后台按 TTL（12 小时）静默刷新本地 LiteLLM 价格缓存，既不阻塞统计，又保证最新模型费率持续生效
+        ModelPricingCatalog.shared.refreshCacheInBackgroundIfNeeded()
+
         // 并行任务 1A：从内置统计引擎拉取除 Antigravity 外的各客户端 Token 用量
         async let graphTask = Task.detached(priority: .userInitiated) { () -> TokenUsageSnapshot in
             var snapshot: TokenUsageSnapshot
@@ -704,57 +744,605 @@ enum TokenUsageCollector {
         return finalSnapshot
     }
 
-    /// 精准估算单个 Agent 的预估费用（按输入、输出、缓存读取、思考推理细分）
+    /// 模型费率（单位：美元 / 百万 Token）
+    private struct ModelRate: Sendable {
+        let input: Double
+        let output: Double
+        let cacheRead: Double
+        let cacheWrite: Double
+    }
+
+    /// 线程安全的动态模型定价目录：
+    /// 1. 优先复用内置 usage-collector（Tokscale）缓存目录下的 custom-pricing.json / pricing-litellm.json / pricing-openrouter.json；
+    /// 2. 后台按 12 小时 TTL 从 LiteLLM 官方源刷新缓存并原子写回 Tokscale 兼容格式；
+    /// 3. 无缓存或未命中时回退至 2026-11 最新官方费率表。
+    private final class ModelPricingCatalog: @unchecked Sendable {
+        static let shared = ModelPricingCatalog()
+
+        private static let litellmPricingURL = URL(
+            string: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+        )!
+        private static let refreshTTL: TimeInterval = 12 * 60 * 60
+        private static let million: Double = 1_000_000
+
+        private static let tokscaleCostFields: [String] = [
+            "input_cost_per_token",
+            "input_cost_per_token_above_128k_tokens",
+            "input_cost_per_token_above_200k_tokens",
+            "input_cost_per_token_above_256k_tokens",
+            "input_cost_per_token_above_272k_tokens",
+            "output_cost_per_token",
+            "output_cost_per_token_above_128k_tokens",
+            "output_cost_per_token_above_200k_tokens",
+            "output_cost_per_token_above_256k_tokens",
+            "output_cost_per_token_above_272k_tokens",
+            "cache_creation_input_token_cost",
+            "cache_creation_input_token_cost_above_200k_tokens",
+            "cache_read_input_token_cost",
+            "cache_read_input_token_cost_above_200k_tokens",
+            "cache_read_input_token_cost_above_272k_tokens",
+        ]
+
+        private static let reasoningSuffixes: [String] = [
+            "-xhigh-fast",
+            "-high-fast",
+            "-medium-fast",
+            "-low-fast",
+            "-xhigh",
+            "-high",
+            "-medium",
+            "-low",
+            "-fast",
+            "-thinking",
+            "-think",
+        ]
+
+        private static let excludedPrefixes: [String] = [
+            "github_copilot/",
+            "azure/",
+            "azure_ai/",
+            "bedrock/",
+            "vertex_ai/",
+            "vertex_ai_beta/",
+            "databricks/",
+            "sagemaker/",
+            "snowflake/",
+            "aihubmix/",
+            "apac.",
+            "eu.",
+            "us.",
+        ]
+
+        private let lock = NSLock()
+        private var customRates: [String: ModelRate] = [:]
+        private var litellmRates: [String: ModelRate] = [:]
+        private var openrouterRates: [String: ModelRate] = [:]
+        private var customMtime: TimeInterval?
+        private var litellmMtime: TimeInterval?
+        private var openrouterMtime: TimeInterval?
+        private var lookupCache: [String: ModelRate] = [:]
+        private var isRefreshingRemote = false
+        private var lastRefreshAttempt: Date?
+
+        private init() {}
+
+        func rate(for rawModel: String, agent: String) -> ModelRate {
+            reloadDiskCachesIfNeeded()
+
+            let cacheKey = "\(agent.lowercased())|\(rawModel)"
+            lock.lock()
+            if let cached = lookupCache[cacheKey] {
+                lock.unlock()
+                return cached
+            }
+            let custom = customRates
+            let litellm = litellmRates
+            let openrouter = openrouterRates
+            lock.unlock()
+
+            let resolved = resolveRate(
+                rawModel: rawModel,
+                agent: agent,
+                custom: custom,
+                litellm: litellm,
+                openrouter: openrouter
+            )
+
+            lock.lock()
+            if lookupCache.count > 512 {
+                lookupCache.removeAll(keepingCapacity: true)
+            }
+            lookupCache[cacheKey] = resolved
+            lock.unlock()
+            return resolved
+        }
+
+        /// 在后台按 TTL 检查并更新本地 LiteLLM 价格缓存（与 usage-collector 共享同一文件）
+        func refreshCacheInBackgroundIfNeeded(force: Bool = false) {
+            let cacheURL = litellmCacheURL()
+            let now = Date()
+
+            lock.lock()
+            if isRefreshingRemote {
+                lock.unlock()
+                return
+            }
+            if !force, let lastAttempt = lastRefreshAttempt, now.timeIntervalSince(lastAttempt) < 30 * 60 {
+                lock.unlock()
+                return
+            }
+            if !force,
+               let mtime = fileModificationDate(at: cacheURL),
+               now.timeIntervalSince(mtime) < Self.refreshTTL {
+                lock.unlock()
+                return
+            }
+            isRefreshingRemote = true
+            lastRefreshAttempt = now
+            lock.unlock()
+
+            Task.detached(priority: .utility) { [weak self] in
+                guard let self else { return }
+                defer {
+                    self.finishRemoteRefresh()
+                }
+                await self.fetchAndPersistLitellmCache(to: cacheURL)
+            }
+        }
+
+        private func finishRemoteRefresh() {
+            lock.lock()
+            isRefreshingRemote = false
+            lock.unlock()
+        }
+
+        private func invalidateLitellmCache() {
+            lock.lock()
+            litellmMtime = nil
+            lookupCache.removeAll(keepingCapacity: true)
+            lock.unlock()
+        }
+
+        private func fetchAndPersistLitellmCache(to destinationURL: URL) async {
+            var request = URLRequest(url: Self.litellmPricingURL)
+            request.timeoutInterval = 15
+            request.setValue("ToolbarMonitor/1.0", forHTTPHeaderField: "User-Agent")
+
+            guard let (data, response) = try? await URLSession.shared.data(for: request),
+                  let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  let rawObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                return
+            }
+
+            // 精简并转换为 Tokscale 缓存格式：{ "timestamp": <unix_sec>, "data": { ... } }
+            var slimData: [String: [String: Any]] = [:]
+            slimData.reserveCapacity(rawObject.count)
+            for (modelKey, value) in rawObject {
+                guard let entry = value as? [String: Any] else { continue }
+                var filtered: [String: Any] = [:]
+                var hasAnyCost = false
+                for field in Self.tokscaleCostFields {
+                    if let num = Self.doubleValue(entry[field]), num.isFinite {
+                        filtered[field] = num
+                        hasAnyCost = true
+                    }
+                }
+                if hasAnyCost {
+                    slimData[modelKey] = filtered
+                }
+            }
+
+            guard !slimData.isEmpty else { return }
+
+            let payload: [String: Any] = [
+                "timestamp": Int64(Date().timeIntervalSince1970),
+                "data": slimData,
+            ]
+            guard let encoded = try? JSONSerialization.data(withJSONObject: payload) else { return }
+
+            let dir = destinationURL.deletingLastPathComponent()
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? encoded.write(to: destinationURL, options: .atomic)
+
+            // 清空内存查找缓存，下次计费自动重新读取最新文件
+            invalidateLitellmCache()
+        }
+
+        private func cacheDirectory() -> URL {
+            TokenUsageCollector.prepareUsageCollectorStorage().appendingPathComponent("cache", isDirectory: true)
+        }
+
+        private func customPricingURL() -> URL {
+            TokenUsageCollector.prepareUsageCollectorStorage().appendingPathComponent("custom-pricing.json", isDirectory: false)
+        }
+
+        private func litellmCacheURL() -> URL {
+            cacheDirectory().appendingPathComponent("pricing-litellm.json", isDirectory: false)
+        }
+
+        private func openrouterCacheURL() -> URL {
+            cacheDirectory().appendingPathComponent("pricing-openrouter.json", isDirectory: false)
+        }
+
+        private func fileModificationDate(at url: URL) -> Date? {
+            (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        }
+
+        private func reloadDiskCachesIfNeeded() {
+            let customURL = customPricingURL()
+            let litellmURL = litellmCacheURL()
+            let openrouterURL = openrouterCacheURL()
+
+            let curCustomMtime = fileModificationDate(at: customURL)?.timeIntervalSince1970
+            let curLitellmMtime = fileModificationDate(at: litellmURL)?.timeIntervalSince1970
+            let curOpenrouterMtime = fileModificationDate(at: openrouterURL)?.timeIntervalSince1970
+
+            lock.lock()
+            let needCustom = curCustomMtime != customMtime
+            let needLitellm = curLitellmMtime != litellmMtime
+            let needOpenrouter = curOpenrouterMtime != openrouterMtime
+            lock.unlock()
+
+            guard needCustom || needLitellm || needOpenrouter else { return }
+
+            let parsedCustom = needCustom ? loadCustomPricing(from: customURL) : nil
+            let parsedLitellm = needLitellm ? loadDatasetPricing(from: litellmURL) : nil
+            let parsedOpenrouter = needOpenrouter ? loadDatasetPricing(from: openrouterURL) : nil
+
+            lock.lock()
+            if needCustom {
+                customRates = parsedCustom ?? [:]
+                customMtime = curCustomMtime
+            }
+            if needLitellm {
+                litellmRates = parsedLitellm ?? [:]
+                litellmMtime = curLitellmMtime
+            }
+            if needOpenrouter {
+                openrouterRates = parsedOpenrouter ?? [:]
+                openrouterMtime = curOpenrouterMtime
+            }
+            lookupCache.removeAll(keepingCapacity: true)
+            lock.unlock()
+        }
+
+        private func loadCustomPricing(from url: URL) -> [String: ModelRate] {
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let models = root["models"] as? [String: Any]
+            else {
+                return [:]
+            }
+
+            var result: [String: ModelRate] = [:]
+            for (rawKey, rawValue) in models {
+                guard let entry = rawValue as? [String: Any] else { continue }
+                let input = Self.doubleValue(entry["input_cost_per_million_tokens"])
+                    ?? Self.doubleValue(entry["input_cost_per_token"]).map { $0 * Self.million }
+                let output = Self.doubleValue(entry["output_cost_per_million_tokens"])
+                    ?? Self.doubleValue(entry["output_cost_per_token"]).map { $0 * Self.million }
+                guard let input, let output, (input > 0 || output > 0) else { continue }
+
+                let cacheRead = Self.doubleValue(entry["cache_read_input_token_cost_per_million_tokens"])
+                    ?? Self.doubleValue(entry["cache_read_input_token_cost"]).map { $0 * Self.million }
+                    ?? 0
+                let cacheWrite = Self.doubleValue(entry["cache_creation_input_token_cost_per_million_tokens"])
+                    ?? Self.doubleValue(entry["cache_creation_input_token_cost"]).map { $0 * Self.million }
+                    ?? 0
+
+                result[rawKey.lowercased()] = ModelRate(
+                    input: input,
+                    output: output,
+                    cacheRead: cacheRead,
+                    cacheWrite: cacheWrite
+                )
+            }
+            return result
+        }
+
+        private func loadDatasetPricing(from url: URL) -> [String: ModelRate] {
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let dataset = (root["data"] as? [String: Any]) ?? (root as [String: Any]?)
+            else {
+                return [:]
+            }
+
+            var result: [String: ModelRate] = [:]
+            result.reserveCapacity(dataset.count)
+
+            for (rawKey, rawValue) in dataset {
+                let lowerKey = rawKey.lowercased()
+                if lowerKey.hasSuffix(":batch") || lowerKey.hasSuffix(":free") {
+                    continue
+                }
+                if Self.excludedPrefixes.contains(where: { lowerKey.hasPrefix($0) }) {
+                    continue
+                }
+                guard let entry = rawValue as? [String: Any] else { continue }
+                let inputPerToken = Self.doubleValue(entry["input_cost_per_token"]) ?? 0
+                let outputPerToken = Self.doubleValue(entry["output_cost_per_token"]) ?? 0
+                guard inputPerToken > 0 || outputPerToken > 0 else { continue }
+
+                let cacheReadPerToken = Self.doubleValue(entry["cache_read_input_token_cost"]) ?? 0
+                let cacheWritePerToken = Self.doubleValue(entry["cache_creation_input_token_cost"]) ?? 0
+
+                result[lowerKey] = ModelRate(
+                    input: inputPerToken * Self.million,
+                    output: outputPerToken * Self.million,
+                    cacheRead: cacheReadPerToken * Self.million,
+                    cacheWrite: cacheWritePerToken * Self.million
+                )
+            }
+            return result
+        }
+
+        private func resolveRate(
+            rawModel: String,
+            agent: String,
+            custom: [String: ModelRate],
+            litellm: [String: ModelRate],
+            openrouter: [String: ModelRate]
+        ) -> ModelRate {
+            let candidates = buildLookupCandidates(for: rawModel)
+            let providerPrefixes = preferredPrefixes(for: rawModel, agent: agent)
+
+            // 1. 自定义覆盖价格
+            if let rate = lookup(candidates: candidates, prefixes: providerPrefixes, in: custom) {
+                return rate
+            }
+            // 2. LiteLLM 官方价格表（与 usage-collector 主口径一致）
+            if let rate = lookup(candidates: candidates, prefixes: providerPrefixes, in: litellm) {
+                return rate
+            }
+            // 3. OpenRouter 价格表
+            if let rate = lookup(candidates: candidates, prefixes: providerPrefixes, in: openrouter) {
+                return rate
+            }
+            // 4. 离线最新兜底费率表
+            return fallbackRate(for: rawModel, agent: agent)
+        }
+
+        private func lookup(
+            candidates: [String],
+            prefixes: [String],
+            in table: [String: ModelRate]
+        ) -> ModelRate? {
+            guard !table.isEmpty else { return nil }
+            for candidate in candidates {
+                if let exact = table[candidate] {
+                    return exact
+                }
+            }
+            for candidate in candidates {
+                for prefix in prefixes {
+                    if let prefixed = table["\(prefix)\(candidate)"] {
+                        return prefixed
+                    }
+                }
+            }
+            return nil
+        }
+
+        private func preferredPrefixes(for rawModel: String, agent: String) -> [String] {
+            let lower = rawModel.lowercased()
+            let agentLower = agent.lowercased()
+
+            if lower.contains("gemini") {
+                return ["gemini/", "google/"]
+            }
+            if lower.contains("claude") {
+                return ["anthropic/", "anthropic."]
+            }
+            if lower.contains("gpt") || lower.hasPrefix("o1") || lower.hasPrefix("o3") || lower.hasPrefix("o4") {
+                return ["openai/"]
+            }
+            if lower.contains("grok") {
+                return ["xai/", "x-ai/"]
+            }
+            if lower.contains("deepseek") {
+                return ["deepseek/"]
+            }
+            if lower.contains("kimi") {
+                return ["moonshot/", "moonshotai/"]
+            }
+            if lower.contains("glm") {
+                return ["zai/", "z-ai/", "zhipu/"]
+            }
+            if agentLower == "antigravity" || agentLower == "agy-cli" || agentLower == "gemini" {
+                return ["gemini/", "google/", "anthropic/", "openai/"]
+            }
+            return ["openai/", "anthropic/", "gemini/", "google/", "xai/", "deepseek/"]
+        }
+
+        private func buildLookupCandidates(for rawModel: String) -> [String] {
+            var seen = Set<String>()
+            var result: [String] = []
+
+            func append(_ value: String) {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty, seen.insert(trimmed).inserted else { return }
+                result.append(trimmed)
+            }
+
+            let rawLower = rawModel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            append(rawLower)
+
+            // 若带供应商前缀，同时保留去掉前缀后的裸模型名
+            let base = rawLower.split(separator: "/").last.map(String.init) ?? rawLower
+            append(base)
+
+            // 去除括号修饰，例如 "Gemini 4 Neon (High)" -> "gemini-4-neon"
+            let withoutParens = base.replacingOccurrences(
+                of: #"\([^)]*\)"#,
+                with: " ",
+                options: .regularExpression
+            )
+            let normalized = withoutParens
+                .replacingOccurrences(of: #"[^a-z0-9.]+"#, with: "-", options: .regularExpression)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+            append(normalized)
+
+            // 迭代剥离尾部推理档位后缀（例如 gemini-4-neon-high -> gemini-4-neon）
+            var stripped = normalized
+            var didStrip = true
+            while didStrip {
+                didStrip = false
+                for suffix in Self.reasoningSuffixes where stripped.hasSuffix(suffix) {
+                    stripped = String(stripped.dropLast(suffix.count))
+                    append(stripped)
+                    didStrip = true
+                    break
+                }
+            }
+
+            // 兼容 Claude 小数点与连字符版本写法（claude-opus-4.6 <-> claude-opus-4-6）
+            let snapshot = result
+            for item in snapshot {
+                if item.hasPrefix("claude-") {
+                    let hyphenMinor = item.replacingOccurrences(
+                        of: #"^(claude-(?:opus|sonnet|haiku|fable)-\d+)\.(\d+)"#,
+                        with: "$1-$2",
+                        options: .regularExpression
+                    )
+                    append(hyphenMinor)
+                    let dotMinor = item.replacingOccurrences(
+                        of: #"^(claude-(?:opus|sonnet|haiku|fable)-\d+)-(\d+)"#,
+                        with: "$1.$2",
+                        options: .regularExpression
+                    )
+                    append(dotMinor)
+                }
+            }
+
+            return result
+        }
+
+        private func fallbackRate(for rawModel: String, agent: String) -> ModelRate {
+            let name = rawModel.lowercased()
+            let agentKey = agent.lowercased()
+
+            // Claude 系列（按 Anthropic 最新官方价）
+            if name.contains("fable") {
+                if name.contains("5-2") || name.contains("5.2") {
+                    return ModelRate(input: 8.00, output: 40.00, cacheRead: 0.20, cacheWrite: 10.00)
+                }
+                return ModelRate(input: 10.00, output: 50.00, cacheRead: 1.00, cacheWrite: 12.50)
+            }
+            if name.contains("opus") {
+                if name.contains("opus-4-1") || name.contains("opus-4.1") || name.contains("opus-4-2025") {
+                    return ModelRate(input: 15.00, output: 75.00, cacheRead: 1.50, cacheWrite: 18.75)
+                }
+                return ModelRate(input: 5.00, output: 25.00, cacheRead: 0.50, cacheWrite: 6.25)
+            }
+            if name.contains("sonnet") {
+                if name.contains("sonnet-5-5") || name.contains("sonnet-5.5") {
+                    return ModelRate(input: 2.00, output: 10.00, cacheRead: 0.10, cacheWrite: 2.50)
+                }
+                if name.contains("sonnet-5") {
+                    return ModelRate(input: 2.00, output: 10.00, cacheRead: 0.20, cacheWrite: 2.50)
+                }
+                return ModelRate(input: 3.00, output: 15.00, cacheRead: 0.30, cacheWrite: 3.75)
+            }
+            if name.contains("haiku") {
+                if name.contains("4-5") || name.contains("4.5") || name.contains("haiku-4") {
+                    return ModelRate(input: 1.00, output: 5.00, cacheRead: 0.10, cacheWrite: 1.25)
+                }
+                return ModelRate(input: 0.80, output: 4.00, cacheRead: 0.08, cacheWrite: 1.00)
+            }
+
+            // Gemini 系列（含 Gemini 4 与 Gemini 3.x / 2.5）
+            if name.contains("gemini") || agentKey == "antigravity" || agentKey == "agy-cli" || agentKey == "gemini" {
+                if name.contains("neon") {
+                    return ModelRate(input: 3.00, output: 15.00, cacheRead: 0.15, cacheWrite: 0)
+                }
+                if name.contains("argon") || name.contains("carbon") {
+                    return ModelRate(input: 2.00, output: 10.00, cacheRead: 0.10, cacheWrite: 0)
+                }
+                if name.contains("hydrogen") {
+                    return ModelRate(input: 1.50, output: 7.50, cacheRead: 0.075, cacheWrite: 0)
+                }
+                if name.contains("3.8-flash") || name.contains("3.7-flash") {
+                    return ModelRate(input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0)
+                }
+                if name.contains("3.5-flash-lite") {
+                    return ModelRate(input: 0.30, output: 2.50, cacheRead: 0.03, cacheWrite: 0)
+                }
+                if name.contains("3.5-flash") {
+                    return ModelRate(input: 1.50, output: 9.00, cacheRead: 0.15, cacheWrite: 0)
+                }
+                if name.contains("3.1-pro") || name.contains("3-pro") || name.contains("3.0-pro") {
+                    return ModelRate(input: 2.00, output: 12.00, cacheRead: 0.20, cacheWrite: 0)
+                }
+                if name.contains("pro") {
+                    return ModelRate(input: 1.25, output: 10.00, cacheRead: 0.125, cacheWrite: 0)
+                }
+                if name.contains("3-flash") || name.contains("3.0-flash") {
+                    return ModelRate(input: 0.50, output: 3.00, cacheRead: 0.05, cacheWrite: 0)
+                }
+                return ModelRate(input: 0.30, output: 2.50, cacheRead: 0.03, cacheWrite: 0)
+            }
+
+            // OpenAI / Codex GPT-6 / GPT-5 系列
+            if name.contains("gpt-6.2-astra") {
+                return ModelRate(input: 8.00, output: 40.00, cacheRead: 0.40, cacheWrite: 10.00)
+            }
+            if name.contains("astra") {
+                return ModelRate(input: 10.00, output: 50.00, cacheRead: 1.00, cacheWrite: 12.50)
+            }
+            if name.contains("gpt-6.2-sol") || name.contains("gpt-6.1-sol") {
+                return ModelRate(input: 2.00, output: 10.00, cacheRead: 0.10, cacheWrite: 2.50)
+            }
+            if name.contains("gpt-6-sol") {
+                return ModelRate(input: 2.00, output: 10.00, cacheRead: 0.20, cacheWrite: 2.50)
+            }
+            if name.contains("gpt-6-luna") || name.contains("gpt-6.1-luna") {
+                return ModelRate(input: 0.10, output: 0.50, cacheRead: 0.01, cacheWrite: 0.125)
+            }
+            if name.contains("gpt-5.6-sol") {
+                return ModelRate(input: 4.00, output: 20.00, cacheRead: 0.40, cacheWrite: 5.00)
+            }
+            if name.contains("gpt-5.6-terra") {
+                return ModelRate(input: 2.00, output: 12.00, cacheRead: 0.20, cacheWrite: 2.50)
+            }
+            if name.contains("gpt-5.6-luna") {
+                return ModelRate(input: 0.20, output: 1.20, cacheRead: 0.02, cacheWrite: 0.25)
+            }
+            if name.contains("luna") || name.contains("nano") {
+                return ModelRate(input: 0.20, output: 1.25, cacheRead: 0.02, cacheWrite: 0)
+            }
+            if name.contains("mini") || name.contains("flash") {
+                return ModelRate(input: 0.75, output: 4.50, cacheRead: 0.075, cacheWrite: 0)
+            }
+            if name.contains("sol") || name.contains("gpt-6") || name.contains("gpt-5") || name.contains("o1") || name.contains("o3") {
+                return ModelRate(input: 2.50, output: 15.00, cacheRead: 0.25, cacheWrite: 0)
+            }
+            return ModelRate(input: 2.50, output: 10.00, cacheRead: 0.25, cacheWrite: 0)
+        }
+
+        private static func doubleValue(_ value: Any?) -> Double? {
+            if let num = value as? NSNumber { return num.doubleValue }
+            if let str = value as? String { return Double(str) }
+            return nil
+        }
+    }
+
+    /// 精准估算单个 Agent 的预估费用（按输入、输出、缓存读取、缓存写入、思考推理细分，优先读取最新动态定价缓存）
     private static func estimateAgentCost(_ agent: AgentTokenUsage) -> Double {
         var totalCost: Double = 0
-        let agentKey = agent.agent.lowercased()
-        let isAntigravityFamily = agentKey == "antigravity" || agentKey == "agy-cli" || agentKey == "gemini"
         let million: Double = 1_000_000
 
         for model in agent.models {
             let tokens = model.tokens
-            let name = model.name.lowercased()
+            let rate = ModelPricingCatalog.shared.rate(for: model.name, agent: agent.agent)
 
-            let inputRate: Double
-            let outputRate: Double
-            let cacheRate: Double
-
-            if isAntigravityFamily {
-                if name.contains("pro") {
-                    (inputRate, outputRate, cacheRate) = (1.25, 5.00, 0.3125)
-                } else if name.contains("opus") {
-                    (inputRate, outputRate, cacheRate) = (15.00, 75.00, 1.50)
-                } else if name.contains("sonnet") {
-                    (inputRate, outputRate, cacheRate) = (3.00, 15.00, 0.30)
-                } else if name.contains("haiku") {
-                    (inputRate, outputRate, cacheRate) = (0.80, 4.00, 0.08)
-                } else {
-                    // Gemini Flash (3.8 / 3.7 / 3.0 等) 及默认费率
-                    (inputRate, outputRate, cacheRate) = (0.15, 0.60, 0.0375)
-                }
-            } else if agentKey.contains("claude") {
-                if name.contains("opus") {
-                    (inputRate, outputRate, cacheRate) = (15.00, 75.00, 1.50)
-                } else if name.contains("haiku") {
-                    (inputRate, outputRate, cacheRate) = (0.80, 4.00, 0.08)
-                } else {
-                    (inputRate, outputRate, cacheRate) = (3.00, 15.00, 0.30)
-                }
-            } else {
-                // Codex / OpenAI / Cursor 族
-                if name.contains("luna") || name.contains("mini") || name.contains("nano") || name.contains("flash") {
-                    (inputRate, outputRate, cacheRate) = (0.15, 0.60, 0.008)
-                } else if name.contains("sol") || name.contains("gpt-6") || name.contains("gpt-5") || name.contains("o1") || name.contains("o3") {
-                    (inputRate, outputRate, cacheRate) = (2.00, 8.00, 0.25)
-                } else {
-                    (inputRate, outputRate, cacheRate) = (2.50, 10.00, 0.25)
-                }
-            }
-
-            let inputCost = (Double(tokens.input) / million) * inputRate
-            let outputCost = (Double(tokens.output + tokens.reasoning) / million) * outputRate
-            let cacheCost = (Double(tokens.cacheRead) / million) * cacheRate
-            totalCost += (inputCost + outputCost + cacheCost)
+            let inputCost = (Double(tokens.input) / million) * rate.input
+            let outputCost = (Double(tokens.output + tokens.reasoning) / million) * rate.output
+            let cacheReadCost = (Double(tokens.cacheRead) / million) * rate.cacheRead
+            let cacheWriteCost = (Double(tokens.cacheWrite) / million) * rate.cacheWrite
+            totalCost += (inputCost + outputCost + cacheReadCost + cacheWriteCost)
         }
         return totalCost
     }
@@ -935,12 +1523,19 @@ enum TokenUsageCollector {
 
         func appendProvider(key: String, title: String, windows: [QuotaWindowUsage]) {
             guard let provider = object(root[key]), isUsable(provider), !windows.isEmpty else { return }
+            let provenance = object(provider["provenance"])
+            let isCached = (provider["cached"] as? Bool == true)
+                || (provider["stale"] as? Bool == true)
+                || (provenance?["stale"] as? Bool == true)
+            let cachedAtText = (provider["cached_at"] as? String) ?? (provenance?["captured_at"] as? String)
             providers.append(
                 ProviderQuotaUsage(
                     id: key,
                     provider: title,
                     plan: plan(provider),
-                    windows: windows
+                    windows: windows,
+                    isCached: isCached,
+                    cachedAt: cachedAtText.flatMap(parseISODate)
                 )
             )
         }
@@ -1723,12 +2318,17 @@ enum TokenUsageCollector {
                 let models = (value.models[agent] ?? [:])
                     .map { ModelTokenUsage(name: $0.key, tokens: $0.value) }
                     .sorted { $0.tokens.total > $1.tokens.total }
-                return AgentTokenUsage(
+                var usage = AgentTokenUsage(
                     agent: agent,
                     tokens: tokens,
                     models: models,
                     estimatedCost: value.agentCosts[agent]
                 )
+                if usage.estimatedCost == nil && usage.tokens.total > 0 {
+                    let estimated = estimateAgentCost(usage)
+                    usage.estimatedCost = estimated > 0 ? estimated : nil
+                }
+                return usage
             }
             .sorted { $0.tokens.total > $1.tokens.total }
 

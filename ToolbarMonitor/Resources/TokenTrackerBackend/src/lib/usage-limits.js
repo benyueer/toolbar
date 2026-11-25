@@ -1936,75 +1936,189 @@ function extractCommandFlag(command, flag) {
   return match?.[1] || null;
 }
 
-async function detectAntigravityProcess({ commandRunner } = {}) {
-  const result = await runCommand(commandRunner, "/bin/ps", ["-ax", "-o", "pid=,command="], {
-    timeout: 4000,
-  });
-  const lines = String(result?.stdout || "").split("\n");
+// 从 ~/.gemini/{antigravity,antigravity-ide,antigravity-cli}/daemon/*.json 读取本地守护进程发现文件（兼容 Antigravity 2.x Hub 模式）
+function readAntigravityDaemonRegistry({ home } = {}) {
+  const geminiHome = path.join(home || os.homedir(), '.gemini')
+  const variants = ['antigravity', 'antigravity-ide', 'antigravity-cli']
+  const byPid = new Map()
 
-  let sawProcess = false;
+  for (const variant of variants) {
+    const daemonDir = path.join(geminiHome, variant, 'daemon')
+    let entries = []
+    try {
+      entries = fs.readdirSync(daemonDir)
+    } catch {
+      continue
+    }
+    for (const name of entries) {
+      if (!name.endsWith('.json')) continue
+      try {
+        const raw = JSON.parse(fs.readFileSync(path.join(daemonDir, name), 'utf8'))
+        const pid = Number(raw?.pid)
+        if (!Number.isFinite(pid) || pid <= 0) continue
+        const csrfToken = typeof raw?.csrfToken === 'string' && raw.csrfToken ? raw.csrfToken : null
+        const httpsPort = Number(raw?.httpsPort)
+        const httpPort = Number(raw?.httpPort)
+        const endpoints = []
+        if (Number.isFinite(httpsPort) && httpsPort > 0) {
+          endpoints.push({ port: httpsPort, scheme: 'https' })
+        }
+        if (Number.isFinite(httpPort) && httpPort > 0) {
+          endpoints.push({ port: httpPort, scheme: 'http' })
+        }
+        const ports = endpoints.map((item) => item.port)
+        byPid.set(pid, {
+          pid,
+          csrfToken,
+          httpsPort: Number.isFinite(httpsPort) && httpsPort > 0 ? httpsPort : null,
+          httpPort: Number.isFinite(httpPort) && httpPort > 0 ? httpPort : null,
+          ports,
+          endpoints,
+        })
+      } catch {
+        // 忽略损坏或正在写入的守护进程文件
+      }
+    }
+  }
+  return byPid
+}
+
+async function detectAntigravityProcess({ commandRunner, home } = {}) {
+  const result = await runCommand(commandRunner, '/bin/ps', ['-ax', '-o', 'pid=,command='], {
+    timeout: 4000,
+  })
+  const lines = String(result?.stdout || '').split('\n')
+  const daemonByPid = readAntigravityDaemonRegistry({ home })
+
+  const candidates = []
   for (const line of lines) {
-    const parsed = parseProcessLine(line);
-    if (!parsed) continue;
-    if (!isAntigravityCommandLine(parsed.command)) continue;
-    sawProcess = true;
-    const csrfToken = extractCommandFlag(parsed.command, "--csrf_token") || null;
-    const extensionPort = extractFirstNumber(extractCommandFlag(parsed.command, "--extension_server_port"));
-    return {
+    const parsed = parseProcessLine(line)
+    if (!parsed) continue
+    if (!isAntigravityCommandLine(parsed.command)) continue
+    const daemonInfo = daemonByPid.get(parsed.pid) || null
+    const csrfToken = extractCommandFlag(parsed.command, '--csrf_token') || daemonInfo?.csrfToken || null
+    const extensionPort = extractFirstNumber(extractCommandFlag(parsed.command, '--extension_server_port'))
+    candidates.push({
       configured: true,
       pid: parsed.pid,
       csrfToken,
       extensionPort: Number.isFinite(extensionPort) ? extensionPort : null,
-    };
+      daemonPorts: daemonInfo?.ports || [],
+      daemonEndpoints: daemonInfo?.endpoints || [],
+    })
   }
 
-  if (sawProcess) {
-    return { configured: true, error: "Antigravity CSRF token not found. Restart Antigravity and retry." };
+  if (!candidates.length) {
+    return { configured: false }
   }
-  return { configured: false };
+
+  // 优先尝试携带 csrfToken 的进程，同优先级下按 PID 从新到旧排序
+  candidates.sort((a, b) => {
+    const aHasToken = a.csrfToken ? 1 : 0
+    const bHasToken = b.csrfToken ? 1 : 0
+    if (aHasToken !== bHasToken) return bHasToken - aHasToken
+    return b.pid - a.pid
+  })
+
+  return {
+    ...candidates[0],
+    candidates,
+  }
 }
 
 function resolveAntigravityLimitsCachePath({ home } = {}) {
-  return path.join(home || os.homedir(), ".tokentracker", "tracker", ANTIGRAVITY_LIMITS_CACHE_FILE);
+  return path.join(home || os.homedir(), '.tokentracker', 'tracker', ANTIGRAVITY_LIMITS_CACHE_FILE)
 }
 
 function parseTimeMs(value) {
-  if (typeof value !== "string" || !value) return null;
-  const ts = Date.parse(value);
-  return Number.isFinite(ts) && ts > 0 ? ts : null;
+  if (typeof value !== 'string' || !value) return null
+  const ts = Date.parse(value)
+  return Number.isFinite(ts) && ts > 0 ? ts : null
 }
 
+const ANTIGRAVITY_FIVE_HOUR_WINDOW_MS = 5 * 60 * 60 * 1000
+const ANTIGRAVITY_SEVEN_DAY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+
 function isCacheWindowUsable(window, { cachedAtMs, nowMs } = {}) {
-  if (!window || typeof window !== "object") return false;
-  const resetAtMs = parseTimeMs(window.reset_at);
-  if (resetAtMs !== null) return resetAtMs > nowMs;
+  if (!window || typeof window !== 'object') return false
+  const resetAtMs = parseTimeMs(window.reset_at)
+  if (resetAtMs !== null) return resetAtMs > nowMs
   return Number.isFinite(cachedAtMs)
-    && nowMs - cachedAtMs <= ANTIGRAVITY_LIMITS_CACHE_UNKNOWN_RESET_TTL_MS;
+    && nowMs - cachedAtMs <= ANTIGRAVITY_LIMITS_CACHE_UNKNOWN_RESET_TTL_MS
+}
+
+// 归一化缓存中的单个额度窗口：若窗口已跨过 reset_at 重置时间点，则自动归零 used_percent 并顺延至下一周期，避免 5h/7d 窗口在缓存回退期间整行消失
+function normalizeAntigravityCachedWindow(window, { cachedAtMs, nowMs, periodMs } = {}) {
+  if (!window || typeof window !== 'object') return null
+  const resetAtMs = parseTimeMs(window.reset_at)
+  if (resetAtMs !== null) {
+    if (resetAtMs > nowMs) return window
+    if (Number.isFinite(periodMs) && periodMs > 0) {
+      const elapsedCycles = Math.floor((nowMs - resetAtMs) / periodMs) + 1
+      const nextResetAtMs = resetAtMs + elapsedCycles * periodMs
+      return {
+        ...window,
+        used_percent: 0,
+        reset_at: new Date(nextResetAtMs).toISOString(),
+      }
+    }
+    return {
+      ...window,
+      used_percent: 0,
+      reset_at: null,
+    }
+  }
+  if (Number.isFinite(cachedAtMs) && nowMs - cachedAtMs <= ANTIGRAVITY_LIMITS_CACHE_UNKNOWN_RESET_TTL_MS) {
+    return window
+  }
+  return null
 }
 
 function hasAntigravityWindow(limits) {
-  return Boolean(limits?.primary_window || limits?.secondary_window || limits?.tertiary_window || limits?.quaternary_window);
+  return Boolean(limits?.primary_window || limits?.secondary_window || limits?.tertiary_window || limits?.quaternary_window)
 }
 
 function normalizeAntigravityCachedLimits(raw, { nowMs = Date.now() } = {}) {
-  const cachedAtMs = parseTimeMs(raw?.cached_at);
-  if (!Number.isFinite(cachedAtMs)) return null;
-  if (cachedAtMs > nowMs + 60_000) return null;
-  if (nowMs - cachedAtMs > ANTIGRAVITY_LIMITS_CACHE_MAX_AGE_MS) return null;
+  const cachedAtMs = parseTimeMs(raw?.cached_at)
+  if (!Number.isFinite(cachedAtMs)) return null
+  if (cachedAtMs > nowMs + 60_000) return null
+  if (nowMs - cachedAtMs > ANTIGRAVITY_LIMITS_CACHE_MAX_AGE_MS) return null
+
+  const primaryWindow = normalizeAntigravityCachedWindow(raw?.primary_window, {
+    cachedAtMs,
+    nowMs,
+    periodMs: ANTIGRAVITY_SEVEN_DAY_WINDOW_MS,
+  })
+  const secondaryWindow = normalizeAntigravityCachedWindow(raw?.secondary_window, {
+    cachedAtMs,
+    nowMs,
+    periodMs: ANTIGRAVITY_FIVE_HOUR_WINDOW_MS,
+  }) || (primaryWindow ? { used_percent: 0, reset_at: null } : null)
+  const tertiaryWindow = normalizeAntigravityCachedWindow(raw?.tertiary_window, {
+    cachedAtMs,
+    nowMs,
+    periodMs: ANTIGRAVITY_SEVEN_DAY_WINDOW_MS,
+  })
+  const quaternaryWindow = normalizeAntigravityCachedWindow(raw?.quaternary_window, {
+    cachedAtMs,
+    nowMs,
+    periodMs: ANTIGRAVITY_FIVE_HOUR_WINDOW_MS,
+  }) || (tertiaryWindow ? { used_percent: 0, reset_at: null } : null)
 
   const cached = {
     configured: true,
     error: null,
-    account_email: typeof raw?.account_email === "string" ? raw.account_email : null,
-    account_plan: typeof raw?.account_plan === "string" ? raw.account_plan : null,
-    primary_window: isCacheWindowUsable(raw?.primary_window, { cachedAtMs, nowMs }) ? raw.primary_window : null,
-    secondary_window: isCacheWindowUsable(raw?.secondary_window, { cachedAtMs, nowMs }) ? raw.secondary_window : null,
-    tertiary_window: isCacheWindowUsable(raw?.tertiary_window, { cachedAtMs, nowMs }) ? raw.tertiary_window : null,
-    quaternary_window: isCacheWindowUsable(raw?.quaternary_window, { cachedAtMs, nowMs }) ? raw.quaternary_window : null,
+    account_email: typeof raw?.account_email === 'string' ? raw.account_email : null,
+    account_plan: typeof raw?.account_plan === 'string' ? raw.account_plan : null,
+    primary_window: primaryWindow,
+    secondary_window: secondaryWindow,
+    tertiary_window: tertiaryWindow,
+    quaternary_window: quaternaryWindow,
     cached: true,
+    stale: true,
     cached_at: raw.cached_at,
-  };
-  return hasAntigravityWindow(cached) ? cached : null;
+  }
+  return hasAntigravityWindow(cached) ? cached : null
 }
 
 function readAntigravityLimitsCache({ home, nowMs = Date.now() } = {}) {
@@ -2458,11 +2572,11 @@ function parseAntigravityModelConfigs(configs) {
 }
 
 function antigravityFamily(model) {
-  const text = `${model?.label || ""} ${model?.model_id || ""}`.toLowerCase();
-  if (text.includes("claude")) return "claude";
-  if (text.includes("gemini") && text.includes("pro")) return "gemini_pro";
-  if (text.includes("gemini") && text.includes("flash")) return "gemini_flash";
-  return "unknown";
+  const text = `${model?.label || ''} ${model?.model_id || ''}`.toLowerCase()
+  if (text.includes('claude') || text.includes('gpt')) return 'claude'
+  if (text.includes('gemini') && text.includes('flash')) return 'gemini_flash'
+  if (text.includes('gemini') || text.includes('orchestrator')) return 'gemini_pro'
+  return 'unknown'
 }
 
 function antigravityPriority(model) {
@@ -2559,55 +2673,88 @@ function normalizeAntigravityQuotaSummary(body) {
     }
   }
 
-  const windows = {
-    primary_window: makeWindow(buckets["3p-weekly"]?.remainingFraction, buckets["3p-weekly"]?.resetTime),
-    secondary_window: makeWindow(buckets["3p-5h"]?.remainingFraction, buckets["3p-5h"]?.resetTime),
-    tertiary_window: makeWindow(buckets["gemini-weekly"]?.remainingFraction, buckets["gemini-weekly"]?.resetTime),
-    quaternary_window: makeWindow(buckets["gemini-5h"]?.remainingFraction, buckets["gemini-5h"]?.resetTime),
-  };
+  const primaryWindow = makeWindow(buckets['3p-weekly']?.remainingFraction, buckets['3p-weekly']?.resetTime)
+  const secondaryWindow = makeWindow(buckets['3p-5h']?.remainingFraction, buckets['3p-5h']?.resetTime)
+  const tertiaryWindow = makeWindow(buckets['gemini-weekly']?.remainingFraction, buckets['gemini-weekly']?.resetTime)
+  const quaternaryWindow = makeWindow(buckets['gemini-5h']?.remainingFraction, buckets['gemini-5h']?.resetTime)
 
   // If the groups parsed but none of the known bucketIds matched (upstream
   // renamed them), treat it as a parse failure so the caller falls back to
   // GetUserStatus rather than rendering an empty, error-free card.
-  if (!windows.primary_window && !windows.secondary_window
-    && !windows.tertiary_window && !windows.quaternary_window) {
-    throw new Error("Could not parse Antigravity quota summary: no known buckets matched.");
+  if (!primaryWindow && !secondaryWindow && !tertiaryWindow && !quaternaryWindow) {
+    throw new Error('Could not parse Antigravity quota summary: no known buckets matched.')
+  }
+
+  // 当周度窗口存在而对应的 5h 滚动窗口未返回时，兜底补全 0% 窗口，确保 4 个维度完整显示
+  const windows = {
+    primary_window: primaryWindow,
+    secondary_window: secondaryWindow || (primaryWindow ? buildWindow({ usedPercent: 0, resetAt: null }) : null),
+    tertiary_window: tertiaryWindow,
+    quaternary_window: quaternaryWindow || (tertiaryWindow ? buildWindow({ usedPercent: 0, resetAt: null }) : null),
   }
 
   return {
     account_email: null, // quota summary doesn't include email
     account_plan: null,  // quota summary doesn't include plan info
     ...windows,
-  };
-}
-
-async function probeAntigravityPort(port, csrfToken, { timeoutMs, requestFn, scheme = "https" } = {}) {
-  try {
-    await requestLocalJson({
-      scheme,
-      port,
-      path: "/exa.language_server_pb.LanguageServerService/GetUnleashData",
-      body: antigravityUnleashBody(),
-      csrfToken,
-      timeoutMs,
-      requestFn,
-    });
-    return true;
-  } catch (_error) {
-    return false;
   }
 }
 
+// 判断错误是否属于连接失败或 HTTP/HTTPS 协议不匹配（这类错误无需在同一端点上重试其他接口）
+function isAntigravityTransportOrProtocolError(error) {
+  const msg = String(error?.message || '')
+  if (/^HTTP 400\b/i.test(msg)) return true
+  if (/\b(ECONNREFUSED|ECONNRESET|EPROTO|ETIMEDOUT|EPIPE|ERR_SSL|socket hang up|timeout)\b/i.test(msg)) {
+    return true
+  }
+  return false
+}
+
+// 为候选进程构造有序的 (scheme, port) 探测列表：优先使用 daemon/*.json 中明确声明的 HTTPS/HTTP 端口
+async function resolveAntigravityCandidateEndpoints(candidate, { commandRunner } = {}) {
+  const endpoints = []
+  const seen = new Set()
+  const addEndpoint = (scheme, port) => {
+    const numPort = Number(port)
+    if (!Number.isFinite(numPort) || numPort <= 0) return
+    const key = `${scheme}:${numPort}`
+    if (seen.has(key)) return
+    seen.add(key)
+    endpoints.push({ scheme, port: numPort })
+  }
+
+  if (Array.isArray(candidate.daemonEndpoints) && candidate.daemonEndpoints.length > 0) {
+    for (const ep of candidate.daemonEndpoints) {
+      addEndpoint(ep.scheme, ep.port)
+    }
+  } else if (Array.isArray(candidate.daemonPorts) && candidate.daemonPorts.length > 0) {
+    for (const port of candidate.daemonPorts) {
+      addEndpoint('https', port)
+      addEndpoint('http', port)
+    }
+  }
+
+  if (!endpoints.length) {
+    const ports = await listAntigravityPorts(candidate.pid, { commandRunner })
+    for (const port of ports) {
+      addEndpoint('https', port)
+      addEndpoint('http', port)
+    }
+  }
+
+  return endpoints
+}
+
 function hasAntigravityInstallEvidence({ home } = {}) {
-  const geminiHome = path.join(home || os.homedir(), ".gemini");
-  return ["antigravity", "antigravity-ide", "antigravity-cli"]
+  const geminiHome = path.join(home || os.homedir(), '.gemini')
+  return ['antigravity', 'antigravity-ide', 'antigravity-cli']
     .some((name) => {
       try {
-        return fs.statSync(path.join(geminiHome, name)).isDirectory();
+        return fs.statSync(path.join(geminiHome, name)).isDirectory()
       } catch {
-        return false;
+        return false
       }
-    });
+    })
 }
 
 async function fetchAntigravityLimits({ home, commandRunner, requestFn, fetchImpl = fetch, timeoutMs = 8000, nowMs = Date.now() } = {}) {
@@ -2616,118 +2763,137 @@ async function fetchAntigravityLimits({ home, commandRunner, requestFn, fetchImp
       configured: true,
       error: null,
       ...normalizeAntigravityResponse(payload, normalizeOptions),
-    };
-    writeAntigravityLimitsCache(result, { home, nowMs });
-    return result;
-  };
+      cached: false,
+      stale: false,
+      cached_at: new Date(nowMs).toISOString(),
+    }
+    writeAntigravityLimitsCache(result, { home, nowMs })
+    return result
+  }
 
   const finalizeQuotaSummary = (payload) => {
     const result = {
       configured: true,
       error: null,
       ...normalizeAntigravityQuotaSummary(payload),
-    };
-    writeAntigravityLimitsCache(result, { home, nowMs });
-    return result;
-  };
+      cached: false,
+      stale: false,
+      cached_at: new Date(nowMs).toISOString(),
+    }
+    writeAntigravityLimitsCache(result, { home, nowMs })
+    return result
+  }
 
   try {
-    const processInfo = await detectAntigravityProcess({ commandRunner });
+    const processInfo = await detectAntigravityProcess({ commandRunner, home })
     if (!processInfo.configured) {
-      const cached = readAntigravityLimitsCache({ home, nowMs });
-      if (cached) return cached;
+      const cached = readAntigravityLimitsCache({ home, nowMs })
+      if (cached) return cached
       // No install evidence → user likely doesn't have Antigravity at all.
       // Return configured:false so the card stays neutral (like other providers).
       if (!hasAntigravityInstallEvidence({ home })) {
-        return { configured: false };
+        return { configured: false }
       }
-      return { configured: true, error: "Antigravity IDE is not running. Launch Antigravity to see usage limits." };
+      return { configured: true, error: 'Antigravity IDE is not running. Launch Antigravity to see usage limits.' }
     }
     if (processInfo.error) {
-      return { configured: true, error: processInfo.error };
+      return { configured: true, error: processInfo.error }
     }
-    const ports = await listAntigravityPorts(processInfo.pid, { commandRunner });
-    let workingPort = null;
-    let workingScheme = "https";
-    for (const port of ports) {
-      if (await probeAntigravityPort(port, processInfo.csrfToken, { timeoutMs, requestFn })) {
-        workingPort = port;
-        break;
+    const candidates = Array.isArray(processInfo.candidates) && processInfo.candidates.length > 0
+      ? processInfo.candidates
+      : [processInfo]
+
+    let lastError = null
+
+    // 直接通过真实额度接口（RetrieveUserQuotaSummary -> GetUserStatus -> GetCommandModelConfigs）探测并拉取数据，
+    // 避免 Antigravity 2.x Hub 模式移除 GetUnleashData 后返回 HTTP 404 导致探测整体失败
+    for (const candidate of candidates) {
+      let endpoints = []
+      try {
+        endpoints = await resolveAntigravityCandidateEndpoints(candidate, { commandRunner })
+      } catch (portErr) {
+        lastError = portErr
+        continue
       }
-      // agy CLI serves both HTTPS and HTTP; no CSRF needed
-      if (!processInfo.csrfToken) {
-        if (await probeAntigravityPort(port, null, { timeoutMs, requestFn, scheme: "http" })) {
-          workingPort = port;
-          workingScheme = "http";
-          break;
+
+      for (const { scheme, port } of endpoints) {
+        // 1. 首选官方聚合接口 RetrieveUserQuotaSummary（提供 7d + 5h 全部额度桶）
+        try {
+          const quotaSummary = await requestLocalJson({
+            scheme,
+            port,
+            path: '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary',
+            body: antigravityDefaultBody(),
+            csrfToken: candidate.csrfToken,
+            timeoutMs,
+            requestFn,
+          })
+          return finalizeQuotaSummary(quotaSummary)
+        } catch (quotaErr) {
+          lastError = quotaErr
+          if (isAntigravityTransportOrProtocolError(quotaErr)) {
+            continue
+          }
+        }
+
+        // 2. 兼容旧版 IDE 服务器（RetrieveUserQuotaSummary 返回 404 时回退 GetUserStatus）
+        try {
+          const userStatus = await requestLocalJson({
+            scheme,
+            port,
+            path: '/exa.language_server_pb.LanguageServerService/GetUserStatus',
+            body: antigravityDefaultBody(),
+            csrfToken: candidate.csrfToken,
+            timeoutMs,
+            requestFn,
+          })
+          return finalize(userStatus)
+        } catch (statusErr) {
+          lastError = statusErr
+          if (isAntigravityTransportOrProtocolError(statusErr)) {
+            continue
+          }
+        }
+
+        // 3. 最后兜底 GetCommandModelConfigs（兼容早期扩展端口）
+        const fallbackPort =
+          Number.isFinite(candidate.extensionPort) && candidate.extensionPort > 0
+            ? candidate.extensionPort
+            : port
+        const fallbackScheme = fallbackPort === port ? scheme : 'http'
+        try {
+          const modelConfigs = await requestLocalJson({
+            scheme: fallbackScheme,
+            port: fallbackPort,
+            path: '/exa.language_server_pb.LanguageServerService/GetCommandModelConfigs',
+            body: antigravityDefaultBody(),
+            csrfToken: candidate.csrfToken,
+            timeoutMs,
+            requestFn,
+          })
+          return finalize(modelConfigs, { fallbackToConfigs: true })
+        } catch (configErr) {
+          lastError = configErr
         }
       }
     }
-    if (!workingPort) {
-      throw new Error("Antigravity port detection failed: no working API port found");
-    }
 
-    try {
-      const quotaSummary = await requestLocalJson({
-        scheme: workingScheme,
-        port: workingPort,
-        path: "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary",
-        body: antigravityDefaultBody(),
-        csrfToken: processInfo.csrfToken,
-        timeoutMs,
-        requestFn,
-      });
-      return finalizeQuotaSummary(quotaSummary);
-    } catch (_quotaError) {
-      // quota summary not available (IDE servers return 404) → fall back to GetUserStatus
-    }
-
-    try {
-      const userStatus = await requestLocalJson({
-        scheme: workingScheme,
-        port: workingPort,
-        path: "/exa.language_server_pb.LanguageServerService/GetUserStatus",
-        body: antigravityDefaultBody(),
-        csrfToken: processInfo.csrfToken,
-        timeoutMs,
-        requestFn,
-      });
-      return finalize(userStatus);
-    } catch (primaryError) {
-      const fallbackPort =
-        Number.isFinite(processInfo.extensionPort) && processInfo.extensionPort > 0
-          ? processInfo.extensionPort
-          : workingPort;
-      // agy has no extension server port; try HTTP on the same port
-      const fallbackScheme = !processInfo.csrfToken && fallbackPort === workingPort
-        ? (workingScheme === "https" ? "http" : "https")
-        : (fallbackPort === workingPort ? "https" : "http");
-      const modelConfigs = await requestLocalJson({
-        scheme: fallbackScheme,
-        port: fallbackPort,
-        path: "/exa.language_server_pb.LanguageServerService/GetCommandModelConfigs",
-        body: antigravityDefaultBody(),
-        csrfToken: processInfo.csrfToken,
-        timeoutMs,
-        requestFn,
-      });
-      return finalize(modelConfigs, { fallbackToConfigs: true });
-    }
+    throw lastError || new Error('Antigravity port detection failed: no working API port found')
   } catch (error) {
-    const cached = readAntigravityLimitsCache({ home, nowMs });
-    if (cached) return cached;
+    const cached = readAntigravityLimitsCache({ home, nowMs })
+    if (cached) return cached
     // If there's no install evidence, this error is likely from a system that
     // never had Antigravity — return neutral state like other providers.
     if (!hasAntigravityInstallEvidence({ home })) {
-      return { configured: false };
+      return { configured: false }
     }
-    const message = error?.message === "timeout"
-      ? "Antigravity quota request timed out."
-      : error?.message || "Unknown error";
+    const message = error?.message === 'timeout'
+      ? 'Antigravity quota request timed out.'
+      : error?.message || 'Unknown error'
     return {
       configured: true,
       error: message,
-    };
+    }
   }
 }
 
