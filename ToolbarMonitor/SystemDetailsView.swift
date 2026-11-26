@@ -755,6 +755,7 @@ private struct TokenDashboardView: View {
                     } else {
                         periodControl
                         activityChart
+                            .zIndex(1)
                         breakdown
                         agentList
                     }
@@ -1471,6 +1472,7 @@ private struct TokenActivityChart: View {
             if data.totalTokens > 0 {
                 plot
                     .frame(height: 146)
+                    .zIndex(1)
             } else {
                 Text("此区间没有 Token 用量")
                     .font(.caption)
@@ -1639,6 +1641,7 @@ private struct TokenActivityChart: View {
                     hoverDetails(data.days[index])
                         .frame(width: width)
                         .fixedSize(horizontal: false, vertical: true)
+                        .compositingGroup()
                         .offset(x: x, y: frame.minY)
                         .allowsHitTesting(false)
                         .accessibilityHidden(true)
@@ -1679,6 +1682,7 @@ private struct TokenActivityChart: View {
                             Text(series.title)
                                 .lineLimit(2)
                                 .truncationMode(.middle)
+                                .fixedSize(horizontal: false, vertical: true)
                             Spacer(minLength: 0)
                             Text(count.tokenText)
                                 .fontWeight(.medium)
