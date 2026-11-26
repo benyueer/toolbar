@@ -672,12 +672,12 @@ private struct TokenDashboardView: View {
     @Namespace private var periodNamespace
 
     private var agentChartStyle: AgentChartStyle {
-        AgentChartStyle(rawValue: agentChartStyleRaw) ?? .treemap
+        AgentChartStyle(rawValue: agentChartStyleRaw) ?? (agentChartStyleRaw == "list" ? .bar : .treemap)
     }
 
     private var agentChartStyleBinding: Binding<AgentChartStyle> {
         Binding(
-            get: { AgentChartStyle(rawValue: agentChartStyleRaw) ?? .treemap },
+            get: { agentChartStyle },
             set: { agentChartStyleRaw = $0.rawValue }
         )
     }
@@ -776,6 +776,9 @@ private struct TokenDashboardView: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 14)
+        }
+        .onAppear {
+            if agentChartStyleRaw == "list" { agentChartStyleRaw = AgentChartStyle.bar.rawValue }
         }
         // 倒计时最小粒度为分钟，使用 30 秒带容差定时器减少弹窗打开时的重绘频率
         .onReceive(Timer.publish(every: 30, tolerance: 5, on: .main, in: .common).autoconnect()) { date in
@@ -1974,7 +1977,8 @@ private enum SquarifiedTreemapLayout {
     static func compute(
         items: [TreemapInputItem],
         in bounds: CGRect,
-        minVisualFraction: Double = 0.022
+        minVisualFraction: Double = 0.022,
+        minimumTileSize: CGSize = .zero
     ) -> [TreemapLayoutRect] {
         guard bounds.width > 0.5, bounds.height > 0.5 else { return [] }
         let positive = items.filter { $0.weight > 0 }.sorted { $0.weight > $1.weight }
@@ -2070,7 +2074,27 @@ private enum SquarifiedTreemapLayout {
             cursor = rowEnd
         }
 
-        return results
+        // 双块布局可通过移动分界线给两边留出文字空间。
+        guard results.count == 2,
+              results.contains(where: { $0.rect.width < minimumTileSize.width || $0.rect.height < minimumTileSize.height })
+        else { return results }
+
+        let fitsSideBySide = bounds.width >= minimumTileSize.width * 2 && bounds.height >= minimumTileSize.height
+        let fitsStacked = bounds.height >= minimumTileSize.height * 2 && bounds.width >= minimumTileSize.width
+        guard fitsSideBySide || fitsStacked else { return results }
+
+        let wasSideBySide = results[0].rect.minX != results[1].rect.minX
+        let sideBySide = fitsSideBySide && (wasSideBySide || !fitsStacked)
+        let extent = sideBySide ? bounds.width : bounds.height
+        let minimum = sideBySide ? minimumTileSize.width : minimumTileSize.height
+        let weightedExtent = extent * CGFloat(adjustedWeights[0] / adjustedTotal)
+        let split = min(max(weightedExtent, minimum), extent - minimum)
+        let (first, second) = bounds.divided(atDistance: split, from: sideBySide ? .minXEdge : .minYEdge)
+
+        return [
+            TreemapLayoutRect(id: results[0].id, rect: first),
+            TreemapLayoutRect(id: results[1].id, rect: second),
+        ]
     }
 
     /// 计算同一排矩形中的最差宽高比（利用已降序特性，O(1) 常数求解）
@@ -2168,7 +2192,6 @@ private enum AgentChartStyle: String, CaseIterable, Identifiable {
     case treemap
     case donut
     case bar
-    case list
 
     var id: String { rawValue }
 
@@ -2177,7 +2200,6 @@ private enum AgentChartStyle: String, CaseIterable, Identifiable {
         case .treemap: "矩形树图"
         case .donut: "环形占比"
         case .bar: "排行柱状图"
-        case .list: "分组列表"
         }
     }
 
@@ -2186,12 +2208,11 @@ private enum AgentChartStyle: String, CaseIterable, Identifiable {
         case .treemap: "square.grid.2x2.fill"
         case .donut: "chart.pie.fill"
         case .bar: "chart.bar.xaxis"
-        case .list: "list.bullet"
         }
     }
 }
 
-/// 4 种图表类型滑动胶囊选择器
+/// 3 种图表类型滑动胶囊选择器
 private struct AgentChartStylePicker: View {
     @Binding var selection: AgentChartStyle
     @Namespace private var pickerNamespace
@@ -2272,10 +2293,25 @@ private struct AgentChartItem: Identifiable {
     let estimatedCost: Double?
     let topColor: Color
     let bottomColor: Color
+    var models: [AgentChartItem] = []
+
+    var hoveredTarget: TreemapHoveredTarget {
+        TreemapHoveredTarget(
+            id: id,
+            agentName: agentName,
+            modelName: drillAgentId == nil ? title : nil,
+            tokens: tokens,
+            sharePercent: sharePercent,
+            estimatedCost: estimatedCost,
+            color: topColor
+        )
+    }
 }
 
-/// Agent 与模型多图表可视化容器（支持矩形树图 / 环形占比 / 排行柱状图 + 统一下钻与悬停检视）
+/// Agent 与模型多图表可视化容器，共用用量悬停检视。
 private struct AgentUsageVisualizationSection: View {
+    private static let minimumModelTileSize = CGSize(width: 82, height: 36)
+
     let agents: [AgentTokenUsage]
     let totalTokens: Int64
     @Binding var chartStyle: AgentChartStyle
@@ -2286,6 +2322,7 @@ private struct AgentUsageVisualizationSection: View {
 
     /// 当前实际聚焦的 Agent：仅 1 个 Agent 时自动直接展开其内部模型视图
     private var activeFocusedAgent: (agent: AgentTokenUsage, index: Int)? {
+        guard chartStyle != .bar else { return nil }
         if let focusedAgentId,
            let idx = agents.firstIndex(where: { $0.id == focusedAgentId }) {
             return (agents[idx], idx)
@@ -2303,27 +2340,9 @@ private struct AgentUsageVisualizationSection: View {
     /// 构造环形图和排行柱状图共用的归一化条目列表
     private var chartItems: [AgentChartItem] {
         if let focused = activeFocusedAgent {
-            let models = resolvedModels(for: focused.agent)
-            let denom = max(Double(focused.agent.tokens.total), 1)
-            return models.enumerated().map { idx, model in
-                let palette = TreemapPalette.modelGradient(
-                    for: focused.agent.agent,
-                    modelIndex: idx,
-                    fallbackIndex: focused.index
-                )
-                return AgentChartItem(
-                    id: "model|\(focused.agent.id)|\(model.id)",
-                    title: model.name,
-                    agentName: focused.agent.displayName,
-                    agentKey: focused.agent.agent,
-                    drillAgentId: nil,
-                    tokens: model.tokens,
-                    sharePercent: Double(model.tokens.total) / denom * 100,
-                    estimatedCost: nil,
-                    topColor: palette.top,
-                    bottomColor: palette.bottom
-                )
-            }
+            return modelChartItems(
+                resolvedModels(for: focused.agent), agent: focused.agent, index: focused.index, total: focused.agent.tokens.total
+            )
         } else {
             let denom = max(Double(totalTokens), 1)
             return agents.enumerated().map { idx, agent in
@@ -2342,9 +2361,34 @@ private struct AgentUsageVisualizationSection: View {
                     sharePercent: Double(agent.tokens.total) / denom * 100,
                     estimatedCost: agent.estimatedCost,
                     topColor: palette.top,
-                    bottomColor: palette.bottom
+                    bottomColor: palette.bottom,
+                    models: modelChartItems(
+                        agent.models,
+                        agent: agent,
+                        index: idx,
+                        total: chartStyle == .bar ? agent.tokens.total : totalTokens
+                    )
                 )
             }
+        }
+    }
+
+    private func modelChartItems(_ models: [ModelTokenUsage], agent: AgentTokenUsage, index: Int, total: Int64) -> [AgentChartItem] {
+        let denom = max(Double(total), 1)
+        return models.enumerated().map { modelIndex, model in
+            let palette = TreemapPalette.modelGradient(for: agent.agent, modelIndex: modelIndex, fallbackIndex: index)
+            return AgentChartItem(
+                id: "model|\(agent.id)|\(model.id)",
+                title: model.name,
+                agentName: agent.displayName,
+                agentKey: agent.agent,
+                drillAgentId: nil,
+                tokens: model.tokens,
+                sharePercent: Double(model.tokens.total) / denom * 100,
+                estimatedCost: nil,
+                topColor: palette.top,
+                bottomColor: palette.bottom
+            )
         }
     }
 
@@ -2373,24 +2417,13 @@ private struct AgentUsageVisualizationSection: View {
                     .frame(height: 168)
                     .transition(.opacity)
                 case .bar:
-                    AgentRankedBarChartView(
-                        items: chartItems,
-                        isAgentLevel: activeFocusedAgent == nil,
-                        hoveredTarget: $hoveredTarget
-                    ) { agentId in
-                        drillDown(to: agentId)
-                    }
+                    AgentRankedBarChartView(items: chartItems, hoveredTarget: $hoveredTarget)
                     .transition(.opacity)
-                case .list:
-                    unifiedListView
-                        .transition(.opacity)
                 }
             }
             .animation(.easeInOut(duration: 0.18), value: chartStyle)
 
-            if chartStyle != .list {
-                inspectorStrip
-            }
+            inspectorStrip
         }
         .onChange(of: agents.map(\.id)) { _, newIds in
             if let focused = focusedAgentId, !newIds.contains(focused) {
@@ -2400,42 +2433,6 @@ private struct AgentUsageVisualizationSection: View {
         }
         .onChange(of: chartStyle) { _, _ in
             hoveredTarget = nil
-        }
-    }
-
-    /// 统一的列表视图：单 Agent / 下钻态直接展示清爽模型明细行（零重复头部），多 Agent 时展示可折叠分组
-    @ViewBuilder
-    private var unifiedListView: some View {
-        if let focused = activeFocusedAgent {
-            let models = resolvedModels(for: focused.agent)
-            let denom = max(focused.agent.tokens.total, 1)
-            VStack(spacing: 4) {
-                ForEach(Array(models.enumerated()), id: \.element.id) { idx, model in
-                    let palette = TreemapPalette.modelGradient(
-                        for: focused.agent.agent,
-                        modelIndex: idx,
-                        fallbackIndex: focused.index
-                    )
-                    ModelUsageRow(model: model, total: denom, color: palette.top)
-                }
-            }
-            .padding(.top, 2)
-        } else {
-            VStack(spacing: 0) {
-                let lastAgentId = agents.last?.id
-                ForEach(Array(agents.enumerated()), id: \.element.id) { index, agent in
-                    AgentUsageGroupView(
-                        agent: agent,
-                        color: colorForAgent(agent.agent, index),
-                        total: totalTokens
-                    )
-                    .padding(.vertical, 4)
-
-                    if agent.id != lastAgentId {
-                        Divider().opacity(0.42)
-                    }
-                }
-            }
         }
     }
 
@@ -2576,9 +2573,14 @@ private struct AgentUsageVisualizationSection: View {
         let models = resolvedModels(for: agent)
         let denom = max(Double(agent.tokens.total), 1)
         let inputs = models.map { TreemapInputItem(id: $0.id, weight: Double($0.tokens.total)) }
-        let rects = SquarifiedTreemapLayout.compute(items: inputs, in: bounds, minVisualFraction: 0.025)
-        let modelsById = Dictionary(uniqueKeysWithValues: models.enumerated().map { ($0.element.id, ($0.element, $0.offset)) })
         let spacing: CGFloat = 3
+        let rects = SquarifiedTreemapLayout.compute(
+            items: inputs,
+            in: bounds,
+            minVisualFraction: 0.025,
+            minimumTileSize: modelTileMinimum(includingGap: spacing)
+        )
+        let modelsById = Dictionary(uniqueKeysWithValues: models.enumerated().map { ($0.element.id, ($0.element, $0.offset)) })
 
         let (tiles, hitRegions): ([SingleModelRenderTile], [TreemapHitRegion]) = {
             var renderTiles: [SingleModelRenderTile] = []
@@ -2674,9 +2676,22 @@ private struct AgentUsageVisualizationSection: View {
     private func multiAgentNestedCanvas(bounds: CGRect) -> some View {
         let totalDenom = max(Double(totalTokens), 1)
         let agentInputs = agents.map { TreemapInputItem(id: $0.id, weight: Double($0.tokens.total)) }
-        let agentRects = SquarifiedTreemapLayout.compute(items: agentInputs, in: bounds, minVisualFraction: 0.055)
-        let agentsById = Dictionary(uniqueKeysWithValues: agents.enumerated().map { ($0.element.id, ($0.element, $0.offset)) })
         let groupGap: CGFloat = 4
+        let headerMinWidth: CGFloat = 76
+        let headerHeight: CGFloat = 19
+        let innerPadding: CGFloat = 3
+        let modelGap: CGFloat = 2
+        let modelMinimum = modelTileMinimum(includingGap: modelGap)
+        let agentRects = SquarifiedTreemapLayout.compute(
+            items: agentInputs,
+            in: bounds,
+            minVisualFraction: 0.055,
+            minimumTileSize: CGSize(
+                width: max(headerMinWidth, modelMinimum.width + innerPadding * 2) + groupGap,
+                height: headerHeight + innerPadding * 2 + modelMinimum.height * 2 + groupGap
+            )
+        )
+        let agentsById = Dictionary(uniqueKeysWithValues: agents.enumerated().map { ($0.element.id, ($0.element, $0.offset)) })
 
         let (groups, hitRegions): ([NestedAgentRenderGroup], [TreemapHitRegion]) = {
             var renderGroups: [NestedAgentRenderGroup] = []
@@ -2693,9 +2708,7 @@ private struct AgentUsageVisualizationSection: View {
                     fallbackIndex: agentIndex
                 )
                 let models = resolvedModels(for: agent)
-                let showHeader = groupRect.width >= 76 && groupRect.height >= 58
-                let innerPadding: CGFloat = 3
-                let headerHeight: CGFloat = 19
+                let showHeader = groupRect.width >= headerMinWidth && groupRect.height >= 58
 
                 if showHeader {
                     let contentWidth = max(groupRect.width - innerPadding * 2, 1)
@@ -2706,14 +2719,15 @@ private struct AgentUsageVisualizationSection: View {
                     let modelRects = SquarifiedTreemapLayout.compute(
                         items: modelInputs,
                         in: CGRect(x: 0, y: 0, width: contentWidth, height: contentHeight),
-                        minVisualFraction: 0.04
+                        minVisualFraction: 0.04,
+                        minimumTileSize: modelMinimum
                     )
                     let modelsById = Dictionary(uniqueKeysWithValues: models.enumerated().map { ($0.element.id, ($0.element, $0.offset)) })
 
                     var childTiles: [NestedModelRenderTile] = []
                     for mLayout in modelRects {
                         guard let (model, modelIndex) = modelsById[mLayout.id] else { continue }
-                        let mRect = insetTileRect(mLayout.rect, gap: 2)
+                        let mRect = insetTileRect(mLayout.rect, gap: modelGap)
                         let palette = TreemapPalette.modelGradient(
                             for: agent.agent,
                             modelIndex: modelIndex,
@@ -2996,11 +3010,7 @@ private struct AgentUsageVisualizationSection: View {
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
 
-                    Text(
-                        activeFocusedAgent == nil
-                            ? "悬停色块查看全名与构成 · 点击色块下钻 Agent"
-                            : "悬停任意模型色块查看完整名称与四维构成"
-                    )
+                    Text(inspectorHint)
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -3029,6 +3039,15 @@ private struct AgentUsageVisualizationSection: View {
         .animation(.easeOut(duration: 0.12), value: hoveredTarget?.id)
     }
 
+    private var inspectorHint: String {
+        if chartStyle == .bar { return "点击 Agent 行展开模型 · 悬停查看用量构成" }
+        if activeFocusedAgent != nil { return "悬停模型查看完整名称与用量构成" }
+        if chartStyle == .donut && agents.contains(where: { $0.models.contains { $0.tokens.total > 0 } }) {
+            return "内圈 Agent · 外圈模型 · 悬停查看用量构成"
+        }
+        return "悬停色块查看全名与构成 · 点击查看 Agent 模型"
+    }
+
     private func inspectorMiniMetric(_ label: String, _ value: Int64, _ color: Color) -> some View {
         HStack(spacing: 3) {
             Circle()
@@ -3055,6 +3074,10 @@ private struct AgentUsageVisualizationSection: View {
             return agent.models
         }
         return [ModelTokenUsage(name: agent.displayName, tokens: agent.tokens)]
+    }
+
+    private func modelTileMinimum(includingGap gap: CGFloat) -> CGSize {
+        CGSize(width: Self.minimumModelTileSize.width + gap, height: Self.minimumModelTileSize.height + gap)
     }
 
     private func insetTileRect(_ rect: CGRect, gap: CGFloat) -> CGRect {
@@ -3256,44 +3279,40 @@ private struct AgentDonutChartView: View {
         let endAngle: Double
     }
 
-    private var slices: [DonutSlice] {
+    private func slices(for items: [AgentChartItem], start: Double, end: Double) -> [DonutSlice] {
         let positive = items.filter { $0.tokens.total > 0 }
         let total = positive.reduce(0.0) { $0 + Double($1.tokens.total) }
         guard total > 0 else { return [] }
 
-        let minAngle = positive.count > 1 ? min(0.075, (2 * .pi * 0.26) / Double(positive.count)) : 0
-        let rawAngles = positive.map { (Double($0.tokens.total) / total) * 2 * .pi }
-        let adjusted = rawAngles.map { max($0, minAngle) }
-        let adjustedSum = adjusted.reduce(0, +)
-        let scale = (2 * .pi) / max(adjustedSum, 0.0001)
+        let sweep = end - start
+        let minAngle = positive.count > 1 ? min(0.075, sweep * 0.26 / Double(positive.count)) : 0
+        let adjusted = positive.map { max(Double($0.tokens.total) / total * sweep, minAngle) }
+        let scale = sweep / adjusted.reduce(0, +)
+        var cursor = start
 
-        var result: [DonutSlice] = []
-        var cursor: Double = 0
-        for (idx, item) in positive.enumerated() {
-            let sweep = adjusted[idx] * scale
-            result.append(
-                DonutSlice(
-                    id: item.id,
-                    item: item,
-                    startAngle: cursor,
-                    endAngle: cursor + sweep
-                )
-            )
-            cursor += sweep
+        return positive.enumerated().map { index, item in
+            let next = index == positive.count - 1 ? end : cursor + adjusted[index] * scale
+            let slice = DonutSlice(id: item.id, item: item, startAngle: cursor, endAngle: next)
+            cursor = next
+            return slice
         }
-        return result
     }
 
     private var activeHoveredItem: AgentChartItem? {
         guard let hoveredId = hoveredTarget?.id else { return nil }
-        return items.first(where: { $0.id == hoveredId })
+        return items.first { $0.id == hoveredId } ?? items.lazy.flatMap(\.models).first { $0.id == hoveredId }
     }
 
     var body: some View {
-        let computedSlices = slices
+        let agentSlices = slices(for: items, start: 0, end: 2 * .pi)
+        let showsModelRing = isAgentLevel && items.contains { $0.models.contains { $0.tokens.total > 0 } }
+        let modelSlices = showsModelRing ? agentSlices.flatMap { segment in
+            let models = self.slices(for: segment.item.models, start: segment.startAngle, end: segment.endAngle)
+            return models.isEmpty ? [segment] : models
+        } : []
 
         HStack(spacing: 12) {
-            donutRing(slices: computedSlices)
+            donutRing(slices: agentSlices, modelSlices: modelSlices)
                 .frame(width: 140, height: 140)
 
             ScrollView(.vertical, showsIndicators: false) {
@@ -3308,98 +3327,42 @@ private struct AgentDonutChartView: View {
         }
     }
 
-    private func donutRing(slices: [DonutSlice]) -> some View {
-        let isDark = colorScheme == .dark
-        return GeometryReader { geometry in
+    private func donutRing(slices: [DonutSlice], modelSlices: [DonutSlice]) -> some View {
+        GeometryReader { geometry in
             let size = geometry.size
             let center = CGPoint(x: size.width / 2, y: size.height / 2)
             let outerRadius = min(size.width, size.height) / 2 - 6
-            let thickness: CGFloat = 14
-            let innerRadius = max(outerRadius - thickness, 20)
-            let gapRadians: Double = slices.count > 1 ? 0.038 : 0
+            let showsModels = !modelSlices.isEmpty
+            let modelInnerRadius = outerRadius - 9
+            let agentOuterRadius = showsModels ? modelInnerRadius - 2 : outerRadius
+            let agentInnerRadius = agentOuterRadius - (showsModels ? 8 : 14)
+
+            let hit: (CGPoint) -> DonutSlice? = { location in
+                let distance = hypot(location.x - center.x, location.y - center.y)
+                if showsModels, distance >= modelInnerRadius - 1 {
+                    guard distance <= outerRadius + 4 else { return nil }
+                    return hitSlice(at: location, center: center, slices: modelSlices)
+                }
+                guard distance >= agentInnerRadius - 2, distance <= agentOuterRadius + 4 else { return nil }
+                return hitSlice(at: location, center: center, slices: slices)
+            }
 
             ZStack {
                 Canvas { context, _ in
-                    let trackRadius = outerRadius - thickness / 2
-                    let trackRect = CGRect(
-                        x: center.x - trackRadius,
-                        y: center.y - trackRadius,
-                        width: trackRadius * 2,
-                        height: trackRadius * 2
-                    )
-                    context.stroke(
-                        Path(ellipseIn: trackRect),
-                        with: .color(Color.primary.opacity(0.065)),
-                        lineWidth: thickness
-                    )
-
-                    for slice in slices {
-                        let isHovered = hoveredTarget?.id == slice.id
-                        let isDimmed = hoveredTarget != nil && !isHovered
-                        let sweep = slice.endAngle - slice.startAngle
-                        let effectiveGap = min(gapRadians, sweep * 0.25)
-                        let sAngle = slice.startAngle + effectiveGap / 2 - .pi / 2
-                        let eAngle = slice.endAngle - effectiveGap / 2 - .pi / 2
-                        guard eAngle > sAngle else { continue }
-
-                        let rOuter = outerRadius + (isHovered ? 3.5 : 0)
-                        let rInner = innerRadius - (isHovered ? 0.5 : 0)
-
-                        var path = Path()
-                        path.addArc(
-                            center: center,
-                            radius: rOuter,
-                            startAngle: .radians(sAngle),
-                            endAngle: .radians(eAngle),
-                            clockwise: false
-                        )
-                        path.addArc(
-                            center: center,
-                            radius: rInner,
-                            startAngle: .radians(eAngle),
-                            endAngle: .radians(sAngle),
-                            clockwise: true
-                        )
-                        path.closeSubpath()
-
-                        let baseAlpha = isDimmed ? 0.28 : (isHovered ? 0.92 : (isDark ? 0.72 : 0.78))
-                        let tailAlpha = isDimmed ? 0.18 : (isHovered ? 0.76 : (isDark ? 0.50 : 0.56))
-                        context.fill(
-                            path,
-                            with: .linearGradient(
-                                Gradient(colors: [
-                                    slice.item.topColor.opacity(baseAlpha),
-                                    slice.item.bottomColor.opacity(tailAlpha)
-                                ]),
-                                startPoint: CGPoint(x: center.x - rOuter, y: center.y - rOuter),
-                                endPoint: CGPoint(x: center.x + rOuter, y: center.y + rOuter)
-                            )
-                        )
-                        context.stroke(
-                            path,
-                            with: .color(
-                                isHovered
-                                    ? Color.white.opacity(isDark ? 0.75 : 0.9)
-                                    : slice.item.topColor.opacity(isDimmed ? 0.15 : 0.45)
-                            ),
-                            lineWidth: isHovered ? 1.1 : 0.6
-                        )
+                    let hovered = activeHoveredItem
+                    drawRing(slices, in: context, center: center, inner: agentInnerRadius, outer: agentOuterRadius, hovered: hovered)
+                    if showsModels {
+                        drawRing(modelSlices, in: context, center: center, inner: modelInnerRadius, outer: outerRadius, hovered: hovered)
                     }
                 }
                 .contentShape(Circle())
                 .onContinuousHover { phase in
                     switch phase {
                     case .active(let location):
-                        let hit = hitSlice(
-                            at: location,
-                            center: center,
-                            innerRadius: innerRadius - 8,
-                            outerRadius: outerRadius + 8,
-                            slices: slices
-                        )
-                        if hoveredTarget?.id != hit?.id {
+                        let next = hit(location)?.item.hoveredTarget
+                        if hoveredTarget?.id != next?.id {
                             withAnimation(.easeOut(duration: 0.12)) {
-                                hoveredTarget = hit.map { makeHoveredTarget(from: $0.item) }
+                                hoveredTarget = next
                             }
                         }
                     case .ended:
@@ -3410,11 +3373,12 @@ private struct AgentDonutChartView: View {
                         }
                     }
                 }
-                .onTapGesture {
-                    if let drillId = activeHoveredItem?.drillAgentId {
+                .gesture(SpatialTapGesture().onEnded { value in
+                    if let key = hit(value.location)?.item.agentKey,
+                       let drillId = items.first(where: { $0.agentKey == key })?.drillAgentId {
                         onDrillDown(drillId)
                     }
-                }
+                })
 
                 // 环中心实时读数
                 VStack(spacing: 1.5) {
@@ -3450,9 +3414,55 @@ private struct AgentDonutChartView: View {
         }
     }
 
+    private func drawRing(
+        _ slices: [DonutSlice],
+        in context: GraphicsContext,
+        center: CGPoint,
+        inner: CGFloat,
+        outer: CGFloat,
+        hovered: AgentChartItem?
+    ) {
+        let isDark = colorScheme == .dark
+        let thickness = outer - inner
+        let radius = (outer + inner) / 2
+        let track = CGRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)
+        context.stroke(Path(ellipseIn: track), with: .color(Color.primary.opacity(0.065)), lineWidth: thickness)
+
+        for slice in slices {
+            let isHovered = hovered?.id == slice.id
+            let isRelated = hovered?.agentKey == slice.item.agentKey
+                && (hovered?.drillAgentId != nil || slice.item.drillAgentId != nil)
+            let isDimmed = hovered != nil && !isHovered && !isRelated
+            let gap = slices.count > 1 ? min(0.038, (slice.endAngle - slice.startAngle) * 0.25) : 0
+            let start = Angle.radians(slice.startAngle + gap / 2 - .pi / 2)
+            let end = Angle.radians(slice.endAngle - gap / 2 - .pi / 2)
+
+            var path = Path()
+            path.addArc(center: center, radius: outer, startAngle: start, endAngle: end, clockwise: false)
+            path.addArc(center: center, radius: inner, startAngle: end, endAngle: start, clockwise: true)
+            path.closeSubpath()
+
+            let baseAlpha = isDimmed ? 0.28 : (isHovered ? 0.92 : (isDark ? 0.74 : 0.8))
+            let tailAlpha = isDimmed ? 0.18 : (isHovered ? 0.76 : (isDark ? 0.52 : 0.58))
+            context.fill(
+                path,
+                with: .linearGradient(
+                    Gradient(colors: [slice.item.topColor.opacity(baseAlpha), slice.item.bottomColor.opacity(tailAlpha)]),
+                    startPoint: CGPoint(x: center.x - outer, y: center.y - outer),
+                    endPoint: CGPoint(x: center.x + outer, y: center.y + outer)
+                )
+            )
+            context.stroke(
+                path,
+                with: .color(isHovered ? Color.white.opacity(0.8) : slice.item.topColor.opacity(isDimmed ? 0.15 : 0.45)),
+                lineWidth: isHovered ? 1.1 : 0.6
+            )
+        }
+    }
+
     private func donutLegendRow(_ item: AgentChartItem) -> some View {
         let isHovered = hoveredTarget?.id == item.id
-        let isDimmed = hoveredTarget != nil && !isHovered
+        let isDimmed = hoveredTarget != nil && !isHovered && activeHoveredItem?.agentKey != item.agentKey
 
         return HStack(spacing: 6) {
             if isAgentLevel {
@@ -3497,7 +3507,7 @@ private struct AgentDonutChartView: View {
         .onHover { hovering in
             withAnimation(.easeOut(duration: 0.12)) {
                 if hovering {
-                    hoveredTarget = makeHoveredTarget(from: item)
+                    hoveredTarget = item.hoveredTarget
                 } else if hoveredTarget?.id == item.id {
                     hoveredTarget = nil
                 }
@@ -3510,32 +3520,10 @@ private struct AgentDonutChartView: View {
         }
     }
 
-    private func hitSlice(
-        at point: CGPoint,
-        center: CGPoint,
-        innerRadius: CGFloat,
-        outerRadius: CGFloat,
-        slices: [DonutSlice]
-    ) -> DonutSlice? {
-        let dx = Double(point.x - center.x)
-        let dy = Double(point.y - center.y)
-        let dist = sqrt(dx * dx + dy * dy)
-        guard dist >= Double(innerRadius), dist <= Double(outerRadius) else { return nil }
-        var angle = atan2(dy, dx) + .pi / 2
-        if angle < 0 { angle += 2 * .pi }
-        return slices.first { angle >= $0.startAngle && angle <= $0.endAngle }
-    }
-
-    private func makeHoveredTarget(from item: AgentChartItem) -> TreemapHoveredTarget {
-        TreemapHoveredTarget(
-            id: item.id,
-            agentName: item.agentName,
-            modelName: isAgentLevel ? nil : item.title,
-            tokens: item.tokens,
-            sharePercent: item.sharePercent,
-            estimatedCost: item.estimatedCost,
-            color: item.topColor
-        )
+    private func hitSlice(at point: CGPoint, center: CGPoint, slices: [DonutSlice]) -> DonutSlice? {
+        let angle = (atan2(point.y - center.y, point.x - center.x) + .pi / 2 + 2 * .pi)
+            .truncatingRemainder(dividingBy: 2 * .pi)
+        return slices.first { angle >= $0.startAngle && angle < $0.endAngle }
     }
 
     private func formatPercent(_ value: Double) -> String {
@@ -3548,11 +3536,10 @@ private struct AgentDonutChartView: View {
 
 private struct AgentRankedBarChartView: View {
     let items: [AgentChartItem]
-    let isAgentLevel: Bool
     @Binding var hoveredTarget: TreemapHoveredTarget?
-    let onDrillDown: (String) -> Void
 
     @Environment(\.colorScheme) private var colorScheme
+    @State private var expandedAgentIds: Set<String> = []
 
     private var maxTokens: Double {
         Double(max(items.map(\.tokens.total).max() ?? 1, 1))
@@ -3562,7 +3549,7 @@ private struct AgentRankedBarChartView: View {
         let peak = maxTokens
         let content = VStack(spacing: 5) {
             ForEach(Array(items.enumerated()), id: \.element.id) { idx, item in
-                barRow(rank: idx + 1, item: item, maxVal: peak)
+                barGroup(rank: idx + 1, item: item, maxVal: peak)
             }
         }
         .padding(.vertical, 2)
@@ -3577,9 +3564,52 @@ private struct AgentRankedBarChartView: View {
         }
     }
 
-    private func barRow(rank: Int, item: AgentChartItem, maxVal: Double) -> some View {
+    private func barGroup(rank: Int, item: AgentChartItem, maxVal: Double) -> some View {
+        let isExpanded = expandedAgentIds.contains(item.id)
+        let row = barRow(rank: rank, item: item, maxVal: maxVal, isExpanded: isExpanded)
+
+        return VStack(alignment: .leading, spacing: 3) {
+            if item.models.isEmpty {
+                row
+            } else {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        if isExpanded {
+                            expandedAgentIds.remove(item.id)
+                        } else {
+                            expandedAgentIds.insert(item.id)
+                        }
+                    }
+                } label: {
+                    row
+                }
+                .buttonStyle(.plain)
+                .accessibilityValue(isExpanded ? "已展开" : "已收起")
+                .help(isExpanded ? "收起模型用量" : "展开模型用量")
+            }
+
+            if isExpanded && !item.models.isEmpty {
+                VStack(spacing: 1) {
+                    ForEach(item.models) { model in
+                        ModelUsageRow(
+                            model: ModelTokenUsage(name: model.title, tokens: model.tokens),
+                            total: item.tokens.total,
+                            color: model.topColor
+                        )
+                        .onHover { setHover($0, item: model) }
+                    }
+                }
+                .padding(.leading, 20)
+                .padding(.trailing, 6)
+                .transition(.opacity)
+            }
+        }
+    }
+
+    private func barRow(rank: Int, item: AgentChartItem, maxVal: Double, isExpanded: Bool) -> some View {
         let isHovered = hoveredTarget?.id == item.id
-        let isDimmed = hoveredTarget != nil && !isHovered
+        let isChildHovered = item.models.contains { $0.id == hoveredTarget?.id }
+        let isDimmed = hoveredTarget != nil && !isHovered && !isChildHovered
         let isDark = colorScheme == .dark
         let relativeRatio = min(max(Double(item.tokens.total) / maxVal, 0), 1)
         let shareLabel = (item.sharePercent > 0 && item.sharePercent < 1)
@@ -3593,15 +3623,21 @@ private struct AgentRankedBarChartView: View {
                     .foregroundStyle(rank <= 3 ? AnyShapeStyle(item.topColor) : AnyShapeStyle(.tertiary))
                     .frame(width: 16, alignment: .leading)
 
-                if isAgentLevel {
-                    AgentBrandLogo(agent: item.agentKey, color: item.topColor, size: 12)
-                }
+                AgentBrandLogo(agent: item.agentKey, color: item.topColor, size: 12)
 
                 Text(item.title)
                     .font(.system(size: 10.5, weight: isHovered ? .semibold : .medium))
                     .foregroundStyle(isHovered ? Color.primary : Color.primary.opacity(0.86))
                     .lineLimit(1)
                     .truncationMode(.tail)
+
+                if !item.models.isEmpty {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 7.5, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .accessibilityHidden(true)
+                }
 
                 Spacer(minLength: 4)
 
@@ -3671,174 +3707,21 @@ private struct AgentRankedBarChartView: View {
         )
         .opacity(isDimmed ? 0.52 : 1.0)
         .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-        .onHover { hovering in
-            withAnimation(.easeOut(duration: 0.12)) {
-                if hovering {
-                    hoveredTarget = TreemapHoveredTarget(
-                        id: item.id,
-                        agentName: item.agentName,
-                        modelName: isAgentLevel ? nil : item.title,
-                        tokens: item.tokens,
-                        sharePercent: item.sharePercent,
-                        estimatedCost: item.estimatedCost,
-                        color: item.topColor
-                    )
-                } else if hoveredTarget?.id == item.id {
-                    hoveredTarget = nil
-                }
-            }
-        }
-        .onTapGesture {
-            if let drillId = item.drillAgentId {
-                onDrillDown(drillId)
+        .onHover { setHover($0, item: item) }
+    }
+
+    private func setHover(_ hovering: Bool, item: AgentChartItem) {
+        withAnimation(.easeOut(duration: 0.12)) {
+            if hovering {
+                hoveredTarget = item.hoveredTarget
+            } else if hoveredTarget?.id == item.id {
+                hoveredTarget = nil
             }
         }
     }
 }
 
-// MARK: - Agent 用量分组与模型明细
-
-private struct AgentUsageGroupView: View {
-    @State private var showModels = false
-    @State private var isHovered = false
-    let agent: AgentTokenUsage
-    let color: Color
-    let total: Int64
-
-    private var sharePercent: Double {
-        guard total > 0 else { return 0 }
-        return min(max(Double(agent.tokens.total) / Double(total) * 100, 0), 100)
-    }
-
-    private var detailedHelpText: String {
-        let totalFormatted = agent.tokens.total.formattedWithSeparators
-        let inFormatted = agent.tokens.input.formattedWithSeparators
-        let outFormatted = agent.tokens.output.formattedWithSeparators
-        let cacheFormatted = (agent.tokens.cacheRead + agent.tokens.cacheWrite).formattedWithSeparators
-        let reasoningFormatted = agent.tokens.reasoning.formattedWithSeparators
-        let costPart = agent.estimatedCost.map { " · 预估 \($0.estimatedCostText)" } ?? ""
-        return "\(agent.displayName)：\(totalFormatted) tokens (输入: \(inFormatted) · 输出: \(outFormatted) · 缓存: \(cacheFormatted) · 推理: \(reasoningFormatted)) · 占所选时段 \(Int(sharePercent.rounded()))%\(costPart)"
-    }
-
-    var body: some View {
-        let percent = sharePercent
-        let roundedPercent = Int(percent.rounded())
-
-        return VStack(alignment: .leading, spacing: 6) {
-            Button {
-                guard !agent.models.isEmpty else { return }
-                withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
-                    showModels.toggle()
-                }
-            } label: {
-                VStack(alignment: .leading, spacing: 7) {
-                    HStack(spacing: 7) {
-                        AgentBrandLogo(agent: agent.agent, color: color, size: 15, showsBackground: true)
-
-                        Text(agent.displayName)
-                            .font(.caption.weight(.semibold))
-                            .lineLimit(1)
-
-                        Spacer(minLength: 6)
-
-                        if let cost = agent.estimatedCost, cost > 0 {
-                            Text(cost.estimatedCostText)
-                                .font(.system(size: 9.5, weight: .semibold, design: .rounded))
-                                .monospacedDigit()
-                                .foregroundStyle(Color(red: 0.20, green: 0.78, blue: 0.48))
-                                .padding(.horizontal, 5.5)
-                                .padding(.vertical, 1.5)
-                                .background(Color.green.opacity(0.11), in: Capsule())
-                        }
-
-                        if !agent.models.isEmpty {
-                            HStack(spacing: 3) {
-                                Text("\(agent.models.count) 模型")
-                                    .font(.system(size: 9.5))
-                                Image(systemName: "chevron.down")
-                                    .font(.system(size: 7.5, weight: .bold))
-                                    .rotationEffect(.degrees(showModels ? 180 : 0))
-                            }
-                            .foregroundStyle(isHovered ? .secondary : .tertiary)
-                            .padding(.horizontal, 5.5)
-                            .padding(.vertical, 1.5)
-                            .background(Color.primary.opacity(isHovered ? 0.07 : 0.035), in: Capsule())
-                        }
-                    }
-
-                    HStack(spacing: 6) {
-                        Text("用量")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .frame(width: 28, alignment: .leading)
-
-                        AccountQuotaBar(percent: percent, style: .usage, tint: color, isEmphasized: isHovered)
-                            .animation(.easeOut(duration: 0.42), value: percent)
-
-                        Text(agent.tokens.total.tokenText)
-                            .font(.system(size: 11, weight: .medium, design: .monospaced))
-                            .foregroundStyle(.primary.opacity(0.85))
-                            .monospacedDigit()
-                            .frame(width: 48, alignment: .trailing)
-
-                        Text("\(roundedPercent)%")
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .foregroundStyle(.tertiary)
-                            .frame(width: 34, alignment: .trailing)
-                    }
-                }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 6)
-                .background(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(isHovered ? Color.primary.opacity(0.045) : Color.clear)
-                )
-                .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            }
-            .buttonStyle(.plain)
-            .onHover { hovering in
-                withAnimation(.easeInOut(duration: 0.14)) {
-                    isHovered = hovering
-                }
-            }
-            .help(detailedHelpText)
-            .accessibilityLabel(
-                "\(agent.displayName)，\(agent.tokens.total.tokenText) Token，占所选时段 \(roundedPercent)%"
-            )
-            .accessibilityHint(agent.models.isEmpty ? "没有模型明细" : "展开或收起模型明细")
-
-            if showModels, !agent.models.isEmpty {
-                ModelBreakdownList(models: agent.models, total: agent.tokens.total, color: color)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-        }
-        .accessibilityElement(children: .contain)
-    }
-}
-
-private struct ModelBreakdownList: View {
-    let models: [ModelTokenUsage]
-    let total: Int64
-    let color: Color
-
-    var body: some View {
-        VStack(spacing: 4) {
-            ForEach(models) { model in
-                ModelUsageRow(model: model, total: total, color: color)
-            }
-        }
-        .padding(.leading, 10)
-        .overlay(alignment: .leading) {
-            RoundedRectangle(cornerRadius: 1)
-                .fill(color.opacity(0.32))
-                .frame(width: 2)
-                .padding(.vertical, 2)
-        }
-        .padding(.leading, 14)
-        .padding(.trailing, 6)
-        .padding(.bottom, 4)
-    }
-}
+// MARK: - 模型用量明细
 
 private struct ModelUsageRow: View {
     let model: ModelTokenUsage
