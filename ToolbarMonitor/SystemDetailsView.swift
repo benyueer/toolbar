@@ -910,6 +910,29 @@ private struct TokenDashboardView: View {
                     .help("最近 30 天已发现 \(snapshot.agents30Days.count) 个活跃 Agent")
             }
 
+            if isViewingCustomHistoricalDay, let selectedDay = activeSelectedDay {
+                Button {
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                        selectedDateKey = lastDayKey
+                        period = .today
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(formatTokenDateKey(selectedDay.dateKey))
+                        Image(systemName: "xmark")
+                            .font(.system(size: 7, weight: .semibold))
+                    }
+                    .font(.system(size: 9.5, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.cyan)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.cyan.opacity(0.12), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .help("清除单日筛选并返回今日")
+            }
+
             Spacer()
 
             HStack(spacing: 2) {
@@ -957,7 +980,6 @@ private struct TokenDashboardView: View {
             range: $activityRange,
             grouping: $activityGrouping,
             selectedDay: currentDay,
-            isHistoricalSelection: isViewingCustomHistoricalDay,
             onSelectDay: { day in
                 withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
                     if selectedDateKey == day.dateKey && day.dateKey != lastDayKey {
@@ -967,12 +989,6 @@ private struct TokenDashboardView: View {
                         selectedDateKey = day.dateKey
                         period = day.dateKey == lastDayKey ? .today : nil
                     }
-                }
-            },
-            onClearSelection: {
-                withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
-                    selectedDateKey = lastDayKey
-                    period = .today
                 }
             }
         )
@@ -1382,9 +1398,14 @@ private struct TokenActivityChartData {
     }
 
     private static let modelColors: [Color] = [
-        .indigo, .mint, .orange, .pink, .cyan, .purple,
-        Color(red: 0.89, green: 0.34, blue: 0.23),
-        Color(red: 0.50, green: 0.69, blue: 0.20),
+        Color(red: 0.43, green: 0.48, blue: 0.91),
+        Color(red: 0.22, green: 0.69, blue: 0.62),
+        Color(red: 0.90, green: 0.59, blue: 0.28),
+        Color(red: 0.84, green: 0.39, blue: 0.61),
+        Color(red: 0.26, green: 0.66, blue: 0.82),
+        Color(red: 0.62, green: 0.45, blue: 0.84),
+        Color(red: 0.83, green: 0.43, blue: 0.35),
+        Color(red: 0.56, green: 0.70, blue: 0.34),
     ]
 
     private static func amounts(for day: DailyTokenUsage, grouping: TokenActivityGrouping) -> [SeriesID: Int64] {
@@ -1425,11 +1446,11 @@ private struct TokenActivityChart: View {
     @Binding var range: TokenActivityRange
     @Binding var grouping: TokenActivityGrouping
     let selectedDay: DailyTokenUsage?
-    let isHistoricalSelection: Bool
     let onSelectDay: (DailyTokenUsage) -> Void
-    let onClearSelection: () -> Void
 
+    @Environment(\.displayScale) private var displayScale
     @State private var hoveredDateKey: String?
+    @State private var isLegendExpanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -1437,6 +1458,10 @@ private struct TokenActivityChart: View {
                 Label("每日 Token 消耗", systemImage: "chart.bar.xaxis")
                     .font(.caption.weight(.semibold))
                     .lineLimit(1)
+
+                if !data.series.isEmpty {
+                    legendToggle
+                }
 
                 Spacer(minLength: 3)
 
@@ -1480,7 +1505,7 @@ private struct TokenActivityChart: View {
                     .frame(maxWidth: .infinity, minHeight: 104)
             }
 
-            if !data.series.isEmpty {
+            if isLegendExpanded && !data.series.isEmpty {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 108), spacing: 7)], alignment: .leading, spacing: 5) {
                     ForEach(data.series) { series in
                         HStack(spacing: 4) {
@@ -1497,9 +1522,8 @@ private struct TokenActivityChart: View {
                         .help(series.title)
                     }
                 }
+                .transition(.opacity)
             }
-
-            dayReadout
         }
         .padding(12)
         .tokenCard()
@@ -1521,7 +1545,13 @@ private struct TokenActivityChart: View {
                         .lineLimit(1)
                         .minimumScaleFactor(0.8)
                         .frame(maxWidth: .infinity, minHeight: 20)
-                        .background(Color.indigo.opacity(isSelected ? 0.22 : 0), in: RoundedRectangle(cornerRadius: 4))
+                        .background {
+                            if isSelected {
+                                RoundedRectangle(cornerRadius: 4)
+                                    .fill(Color.indigo.opacity(0.17))
+                                    .strokeBorder(Color.indigo.opacity(0.24), lineWidth: 0.5)
+                            }
+                        }
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -1529,39 +1559,34 @@ private struct TokenActivityChart: View {
             }
         }
         .padding(2)
-        .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6))
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
         .accessibilityElement(children: .contain)
         .accessibilityLabel(label)
     }
 
-    private var dayReadout: some View {
-        HStack(spacing: 5) {
-            if isHistoricalSelection, let selectedDay {
-                Button(action: onClearSelection) {
-                    HStack(spacing: 4) {
-                        Text(formatTokenDateKey(selectedDay.dateKey))
-                        Image(systemName: "xmark")
-                            .font(.system(size: 7, weight: .semibold))
-                    }
-                    .foregroundStyle(.cyan)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color.cyan.opacity(0.12), in: Capsule())
-                }
-                .buttonStyle(.plain)
-                .help("清除单日筛选并返回今日")
+    private var legendToggle: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                isLegendExpanded.toggle()
             }
-
-            Spacer(minLength: 0)
-
-            if data.totalTokens > 0 {
-                Text("点击柱条查看当天明细")
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 7, weight: .semibold))
+                    .rotationEffect(.degrees(isLegendExpanded ? 90 : 0))
+                    .accessibilityHidden(true)
+                Text("图例")
+                    .font(.system(size: 9.5, design: .rounded))
             }
+            .foregroundStyle(isLegendExpanded ? Color.primary : Color.secondary)
+            .fixedSize()
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(Color.primary.opacity(isLegendExpanded ? 0.09 : 0.04), in: RoundedRectangle(cornerRadius: 4))
+            .contentShape(Rectangle())
         }
-        .font(.system(size: 9.5, design: .rounded))
-        .monospacedDigit()
-        .foregroundStyle(.secondary)
-        .frame(minHeight: 14)
+        .buttonStyle(.plain)
+        .accessibilityValue(isLegendExpanded ? "已展开" : "已折叠")
     }
 
     private var plot: some View {
@@ -1587,14 +1612,17 @@ private struct TokenActivityChart: View {
                 ForEach(0...data.tickCount, id: \.self) { tick in
                     let value = Double(tick) * data.tickStep
                     let count = value < Double(Int64.max) ? Int64(value) : Int64.max
-                    Text(count.tokenText)
+                    Text(count.tokenText.replacingOccurrences(of: ".0", with: ""))
                         .frame(width: frame.minX - 6, alignment: .trailing)
                         .position(x: (frame.minX - 6) / 2, y: frame.maxY - frame.height * CGFloat(tick) / CGFloat(data.tickCount))
                         .accessibilityHidden(true)
                 }
 
                 ForEach(dateTicks, id: \.self) { index in
+                    let isSelected = data.days[index].id == selectedDay?.id
                     Text(String(data.days[index].id.suffix(5)))
+                        .fontWeight(isSelected ? .semibold : .regular)
+                        .foregroundStyle(isSelected ? .primary : .secondary)
                         .frame(width: dateLabelWidth)
                         .position(x: columnCenter(index, frame: frame, slot: slot), y: frame.maxY + 12)
                         .accessibilityHidden(true)
@@ -1675,7 +1703,7 @@ private struct TokenActivityChart: View {
                     let count = day.amounts[index]
                     if count > 0 {
                         let series = data.series[index]
-                        HStack(spacing: 5) {
+                        HStack(alignment: .firstTextBaseline, spacing: 5) {
                             RoundedRectangle(cornerRadius: 2)
                                 .fill(series.color)
                                 .frame(width: 7, height: 7)
@@ -1706,59 +1734,86 @@ private struct TokenActivityChart: View {
 
     private func drawPlot(in context: GraphicsContext, frame: CGRect, slot: CGFloat, dateTicks: [Int]) {
         let upperLimit = data.tickStep * Double(data.tickCount)
-        let barWidth = min(28, max(1, slot * 0.68))
+        let barWidth = columnWidth(slot: slot)
+        let baseline = pixelAligned(frame.maxY)
+        let plotHeight = baseline - pixelAligned(frame.minY)
+        let pixel = 1 / displayScale
+
+        func boundary(for count: Int64) -> CGFloat {
+            pixelAligned(baseline - plotHeight * CGFloat(Double(count) / upperLimit))
+        }
 
         for tick in 0...data.tickCount {
-            let y = frame.maxY - frame.height * CGFloat(tick) / CGFloat(data.tickCount)
-            var line = Path()
-            line.move(to: CGPoint(x: frame.minX, y: y))
-            line.addLine(to: CGPoint(x: frame.maxX, y: y))
-            context.stroke(line, with: .color(.primary.opacity(tick == 0 ? 0.20 : 0.085)), lineWidth: 0.5)
+            let y = pixelAligned(baseline - plotHeight * CGFloat(tick) / CGFloat(data.tickCount))
+            let line = CGRect(x: frame.minX, y: y, width: frame.width, height: pixel)
+            context.fill(Path(line), with: .color(.primary.opacity(tick == 0 ? 0.16 : 0.06)))
         }
 
         var tickMarks = Path()
         for index in dateTicks {
             let x = columnCenter(index, frame: frame, slot: slot)
-            tickMarks.move(to: CGPoint(x: x, y: frame.maxY))
-            tickMarks.addLine(to: CGPoint(x: x, y: frame.maxY + 3))
+            tickMarks.move(to: CGPoint(x: x, y: baseline))
+            tickMarks.addLine(to: CGPoint(x: x, y: baseline + 3))
         }
-        context.stroke(tickMarks, with: .color(.primary.opacity(0.24)), lineWidth: 0.5)
+        context.stroke(tickMarks, with: .color(.primary.opacity(0.16)), lineWidth: pixel)
 
         for (index, day) in data.days.enumerated() {
             let center = columnCenter(index, frame: frame, slot: slot)
-            let cellX = center - slot / 2
             let barX = center - barWidth / 2
             let isSelected = selectedDay?.id == day.id
             let isHovered = hoveredDateKey == day.id
+            let top = boundary(for: day.usage.tokens.total)
 
-            if isSelected || isHovered {
-                let cell = CGRect(x: cellX, y: frame.minY, width: slot, height: frame.height)
-                context.fill(Path(roundedRect: cell, cornerRadius: 3), with: .color(.indigo.opacity(isSelected ? 0.15 : 0.09)))
+            if isSelected {
+                let marker = CGRect(x: barX, y: baseline + 2, width: barWidth, height: 2 * pixel)
+                context.fill(Path(marker), with: .color(.indigo.opacity(0.8)))
             }
 
-            let totalHeight = frame.height * CGFloat(Double(day.usage.tokens.total) / upperLimit)
-            guard totalHeight > 0 else { continue }
-            let bounds = CGRect(x: barX, y: frame.maxY - totalHeight, width: barWidth, height: totalHeight)
-            let outline = Path(roundedRect: bounds, cornerRadius: min(3, totalHeight / 2, barWidth / 2))
+            if isHovered && top > frame.minY + 2 {
+                var guide = Path()
+                guide.move(to: CGPoint(x: center, y: frame.minY))
+                guide.addLine(to: CGPoint(x: center, y: top - 2))
+                context.stroke(guide, with: .color(.primary.opacity(0.22)), style: StrokeStyle(lineWidth: pixel, dash: [2, 3]))
+            }
+
+            guard top < baseline else { continue }
+            let bounds = CGRect(x: barX, y: top, width: barWidth, height: baseline - top)
+            let capRadius = min(1.75, bounds.height / 2, barWidth / 2)
+            let outline = UnevenRoundedRectangle(
+                topLeadingRadius: capRadius, topTrailingRadius: capRadius, style: .circular
+            ).path(in: bounds)
             var barContext = context
             barContext.clip(to: outline)
 
-            var bottom = frame.maxY
+            var cumulative: Int64 = 0
+            var bottom = baseline
             for (series, count) in zip(data.series, day.amounts) where count > 0 {
-                let height = frame.height * CGFloat(Double(count) / upperLimit)
-                let segment = CGRect(x: barX, y: bottom - height, width: barWidth, height: height)
-                barContext.fill(Path(segment), with: .color(series.color.opacity(isHovered || isSelected ? 1 : 0.86)))
-                bottom -= height
+                cumulative += count
+                let edge = boundary(for: cumulative)
+                guard edge < bottom else { continue }
+                let segment = CGRect(x: barX, y: edge, width: barWidth, height: bottom - edge)
+                barContext.fill(Path(segment), with: .color(series.color.opacity(isHovered ? 1 : 0.9)))
+                bottom = edge
             }
 
-            if isSelected || isHovered {
-                context.stroke(outline, with: .color(.primary.opacity(0.5)), lineWidth: 0.7)
+            if isHovered {
+                barContext.stroke(outline, with: .color(.primary.opacity(0.3)), lineWidth: 2 * pixel)
             }
         }
     }
 
+    private func pixelAligned(_ value: CGFloat) -> CGFloat {
+        (value * displayScale).rounded() / displayScale
+    }
+
+    private func columnWidth(slot: CGFloat) -> CGFloat {
+        pixelAligned(min(22, max(1, slot * 0.58)))
+    }
+
     private func columnCenter(_ index: Int, frame: CGRect, slot: CGFloat) -> CGFloat {
-        frame.minX + (CGFloat(index) + 0.5) * slot
+        let center = frame.minX + (CGFloat(index) + 0.5) * slot
+        let halfWidth = columnWidth(slot: slot) / 2
+        return pixelAligned(center - halfWidth) + halfWidth
     }
 
     private func dateTickIndices(width: CGFloat) -> [Int] {
