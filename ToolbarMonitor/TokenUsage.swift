@@ -194,7 +194,6 @@ struct TokenUsageSnapshot: Equatable, Sendable {
     private(set) var last7DaysEstimatedCost: Double?
     private(set) var last30Days = TokenBreakdown()
     private(set) var last30DaysEstimatedCost: Double?
-    private(set) var maxDailyTokens: Int64 = 0
     private(set) var agents1Day: [AgentTokenUsage] = []
     private(set) var agents7Days: [AgentTokenUsage] = []
     private(set) var agents30Days: [AgentTokenUsage] = []
@@ -228,7 +227,6 @@ struct TokenUsageSnapshot: Equatable, Sendable {
         last7DaysEstimatedCost = computeEstimatedCost(last: 7)
         last30Days = computeTotals(last: 30)
         last30DaysEstimatedCost = computeEstimatedCost(last: 30)
-        maxDailyTokens = days.reduce(0) { max($0, $1.tokens.total) }
         agents1Day = selectedDays(last: 1).first?.agents ?? []
         agents7Days = computeAgents(last: 7)
         agents30Days = computeAgents(last: 30)

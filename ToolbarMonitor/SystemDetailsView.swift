@@ -663,7 +663,8 @@ private struct TokenDashboardView: View {
 
     @State private var period: TokenPeriod? = .today
     @State private var selectedDateKey: String? = nil
-    @State private var hoveredActivityDay: DailyTokenUsage? = nil
+    @State private var activityRange: TokenActivityRange = .last30Days
+    @State private var activityGrouping: TokenActivityGrouping = .model
     @State private var hoveredBreakdownKind: TokenBreakdownKind? = nil
     @State private var quotaLabelWidth: CGFloat = 0
     @State private var currentTime = Date()
@@ -753,7 +754,7 @@ private struct TokenDashboardView: View {
                         emptyState
                     } else {
                         periodControl
-                        activityStrip
+                        activityChart
                         breakdown
                         agentList
                     }
@@ -946,104 +947,34 @@ private struct TokenDashboardView: View {
         .padding(.top, 2)
     }
 
-    private var activityStrip: some View {
+    private var activityChart: some View {
         let currentDay = activeSelectedDay
         let lastDayKey = snapshot.days.last?.dateKey
-        let maxTokens = snapshot.maxDailyTokens
 
-        return VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 6) {
-                Label("最近 30 天", systemImage: "chart.bar.fill")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
-
-                if let day = currentDay, day.dateKey != lastDayKey {
-                    Button {
-                        withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
-                            selectedDateKey = lastDayKey
-                            period = .today
-                        }
-                    } label: {
-                        HStack(spacing: 3) {
-                            Text(formatTokenDateKey(day.dateKey))
-                            Image(systemName: "xmark")
-                                .font(.system(size: 7.5, weight: .bold))
-                        }
-                        .font(.system(size: 9.5, weight: .semibold))
-                        .foregroundStyle(.cyan)
-                        .padding(.horizontal, 6.5)
-                        .padding(.vertical, 2)
-                        .background(Color.cyan.opacity(0.14), in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .help("点击清除选中日期并返回今日")
-                    .transition(.scale.combined(with: .opacity))
-                }
-
-                Spacer()
-
-                // 悬停某日柱子时在标题右侧直接平滑展示明细，彻底避免悬浮气泡遮挡内容
-                if let hovered = hoveredActivityDay {
-                    HStack(spacing: 5) {
-                        Text(formatTokenDateKey(hovered.dateKey))
-                            .foregroundStyle(.secondary)
-                        Text(hovered.tokens.total.tokenText)
-                            .fontWeight(.semibold)
-                            .foregroundStyle(.primary)
-                        if let cost = hovered.estimatedCost, cost > 0 {
-                            Text(cost.estimatedCostText)
-                                .fontWeight(.medium)
-                                .foregroundStyle(Color(red: 0.20, green: 0.78, blue: 0.48))
-                        }
-                    }
-                    .font(.system(size: 10, design: .rounded))
-                    .monospacedDigit()
-                    .transition(.opacity)
-                } else {
-                    Text("峰值 \(maxTokens.tokenText)")
-                        .font(.system(size: 10, design: .rounded))
-                        .monospacedDigit()
-                        .foregroundStyle(.tertiary)
-                        .transition(.opacity)
-                }
-            }
-            .animation(.easeOut(duration: 0.14), value: hoveredActivityDay?.id)
-
-            TokenActivityStrip(
-                days: snapshot.days,
-                maxTokens: max(maxTokens, 1),
-                selectedDateKey: currentDay?.dateKey,
-                hoveredDay: $hoveredActivityDay
-            ) { day in
+        return TokenActivityChart(
+            data: TokenActivityChartData(days: activityRange.select(from: snapshot.days), grouping: activityGrouping),
+            range: $activityRange,
+            grouping: $activityGrouping,
+            selectedDay: currentDay,
+            isHistoricalSelection: isViewingCustomHistoricalDay,
+            onSelectDay: { day in
                 withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
                     if selectedDateKey == day.dateKey && day.dateKey != lastDayKey {
                         selectedDateKey = lastDayKey
                         period = .today
                     } else {
                         selectedDateKey = day.dateKey
-                        if day.dateKey == lastDayKey {
-                            period = .today
-                        } else {
-                            period = nil
-                        }
+                        period = day.dateKey == lastDayKey ? .today : nil
                     }
                 }
+            },
+            onClearSelection: {
+                withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                    selectedDateKey = lastDayKey
+                    period = .today
+                }
             }
-            .frame(height: 50)
-
-            HStack {
-                Text("30 天前")
-                Spacer()
-                Text("点击柱条筛选单日")
-                    .foregroundStyle(.quaternary)
-                Spacer()
-                Text("今天")
-            }
-            .font(.system(size: 8.5))
-            .foregroundStyle(.tertiary)
-        }
-        .padding(12)
-        .tokenCard()
+        )
     }
 
     private var breakdown: some View {
@@ -1309,7 +1240,7 @@ private struct TokenStatCard: View {
     }
 }
 
-// MARK: - 30 天柱状图
+// MARK: - 每日 Token 堆叠图
 
 /// 格式化形如 "2026-10-29" 的日期字符串为 "10月29日"
 private func formatTokenDateKey(_ key: String) -> String {
@@ -1320,123 +1251,526 @@ private func formatTokenDateKey(_ key: String) -> String {
     return key
 }
 
-private struct TokenActivityStrip: View {
-    let days: [DailyTokenUsage]
-    let maxTokens: Int64
-    var selectedDateKey: String? = nil
-    @Binding var hoveredDay: DailyTokenUsage?
-    var onSelectDay: ((DailyTokenUsage) -> Void)? = nil
+private enum TokenActivityRange: String, CaseIterable, Identifiable {
+    case last30Days = "近 30 天"
+    case last14Days = "近 14 天"
+    case thisWeek = "本周"
+    case lastWeek = "上周"
+    case active14Days = "活跃 14 日"
+
+    var id: Self { self }
+
+    func select(from days: [DailyTokenUsage]) -> [DailyTokenUsage] {
+        switch self {
+        case .last30Days:
+            return Array(days.suffix(30))
+        case .last14Days:
+            return Array(days.suffix(14))
+        case .active14Days:
+            return Array(days.filter { $0.tokens.total > 0 }.suffix(14))
+        case .thisWeek, .lastWeek:
+            guard let anchorKey = days.last?.dateKey,
+                  let anchor = Self.dateFormatter.date(from: anchorKey)
+            else { return [] }
+
+            let calendar = Self.dateFormatter.calendar ?? Calendar(identifier: .iso8601)
+            let offset = self == .lastWeek ? -1 : 0
+            guard let reference = calendar.date(byAdding: .weekOfYear, value: offset, to: anchor),
+                  let week = calendar.dateInterval(of: .weekOfYear, for: reference)
+            else { return [] }
+
+            let start = Self.dateFormatter.string(from: week.start)
+            let end = Self.dateFormatter.string(from: week.end)
+            return days.filter { $0.dateKey >= start && $0.dateKey < end }
+        }
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .iso8601)
+        formatter.timeZone = .autoupdatingCurrent
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+}
+
+private enum TokenActivityGrouping: String, CaseIterable, Identifiable {
+    case model = "按模型"
+    case agent = "按来源"
+
+    var id: Self { self }
+}
+
+private struct TokenActivityChartData {
+    enum SeriesID: Hashable {
+        case named(String)
+        case other
+    }
+
+    struct Series: Identifiable {
+        let id: SeriesID
+        let title: String
+        let color: Color
+    }
+
+    struct Day: Identifiable {
+        let usage: DailyTokenUsage
+        let amounts: [Int64]
+
+        var id: String { usage.id }
+    }
+
+    let days: [Day]
+    let series: [Series]
+    let totalTokens: Int64
+    let estimatedCost: Double?
+    let hasUnpricedUsage: Bool
+    let tickStep: Double
+    let tickCount: Int
+
+    init(days usages: [DailyTokenUsage], grouping: TokenActivityGrouping) {
+        let dailyAmounts = usages.map { Self.amounts(for: $0, grouping: grouping) }
+        var totals: [SeriesID: Int64] = [:]
+        for amounts in dailyAmounts {
+            for (id, count) in amounts {
+                totals[id, default: 0] += count
+            }
+        }
+
+        let rankedNames = totals.compactMap { id, count -> (name: String, count: Int64)? in
+            guard case let .named(name) = id else { return nil }
+            return (name, count)
+        }.sorted { lhs, rhs in
+            lhs.count == rhs.count ? lhs.name < rhs.name : lhs.count > rhs.count
+        }
+        let names = rankedNames.prefix(Self.modelColors.count).map(\.name)
+        let visible = Set(names.map(SeriesID.named))
+        var series = names.enumerated().map { index, name in
+            Series(
+                id: .named(name),
+                title: grouping == .model ? name : AgentTokenUsage.displayName(for: name),
+                color: grouping == .model
+                    ? Self.modelColors[index]
+                    : TreemapPalette.agentHeaderTint(for: name, fallbackIndex: index)
+            )
+        }
+        if totals.keys.contains(where: { !visible.contains($0) }) {
+            series.append(Series(id: .other, title: "其他", color: Color(red: 0.45, green: 0.51, blue: 0.60)))
+        }
+        self.series = series
+        days = zip(usages, dailyAmounts).map { usage, counts in
+            let other = counts.reduce(into: Int64(0)) { sum, entry in
+                if !visible.contains(entry.key) { sum += entry.value }
+            }
+            return Day(usage: usage, amounts: series.map { $0.id == .other ? other : counts[$0.id, default: 0] })
+        }
+
+        totalTokens = usages.reduce(0) { $0 + $1.tokens.total }
+        let costs = usages.filter { $0.tokens.total > 0 }.compactMap(\.estimatedCost)
+        estimatedCost = costs.isEmpty ? nil : costs.reduce(0, +)
+        hasUnpricedUsage = usages.contains { $0.tokens.total > 0 && $0.estimatedCost == nil }
+
+        let peak = Double(usages.map(\.tokens.total).max() ?? 0)
+        let interval = max(peak / 4, 1)
+        let magnitude = pow(10, floor(log10(interval)))
+        let factor = [1.0, 1.5, 2, 2.5, 3, 5, 7.5, 10].first { $0 * magnitude >= interval } ?? 10
+        let step = max(1, ceil(factor * magnitude))
+        tickStep = step
+        tickCount = max(1, Int(ceil(peak / step)))
+    }
+
+    private static let modelColors: [Color] = [
+        .indigo, .mint, .orange, .pink, .cyan, .purple,
+        Color(red: 0.89, green: 0.34, blue: 0.23),
+        Color(red: 0.50, green: 0.69, blue: 0.20),
+    ]
+
+    private static func amounts(for day: DailyTokenUsage, grouping: TokenActivityGrouping) -> [SeriesID: Int64] {
+        let total = day.tokens.total
+        guard total > 0 else { return [:] }
+        let agents = day.agents.filter { $0.tokens.total > 0 }
+        let attributed = agents.reduce(0) { $0 + $1.tokens.total }
+        // 明细与日总量冲突时，保留总量，避免把重叠用量画成有效分组。
+        guard attributed <= total else { return [.other: total] }
+
+        var result: [SeriesID: Int64] = [:]
+        for agent in agents {
+            if grouping == .agent {
+                result[.named(agent.agent), default: 0] += agent.tokens.total
+                continue
+            }
+
+            let models = agent.models.filter { $0.tokens.total > 0 }
+            let modeled = models.reduce(0) { $0 + $1.tokens.total }
+            if modeled <= agent.tokens.total {
+                for model in models {
+                    result[.named(model.name), default: 0] += model.tokens.total
+                }
+                if modeled < agent.tokens.total {
+                    result[.other, default: 0] += agent.tokens.total - modeled
+                }
+            } else {
+                result[.other, default: 0] += agent.tokens.total
+            }
+        }
+        if attributed < total { result[.other, default: 0] += total - attributed }
+        return result
+    }
+}
+
+private struct TokenActivityChart: View {
+    let data: TokenActivityChartData
+    @Binding var range: TokenActivityRange
+    @Binding var grouping: TokenActivityGrouping
+    let selectedDay: DailyTokenUsage?
+    let isHistoricalSelection: Bool
+    let onSelectDay: (DailyTokenUsage) -> Void
+    let onClearSelection: () -> Void
+
+    @State private var hoveredDateKey: String?
 
     var body: some View {
-        GeometryReader { geometry in
-            let maximum = Double(max(maxTokens, 1))
-            let gap: CGFloat = 2.5
-            let totalGap = gap * CGFloat(max(days.count - 1, 0))
-            let width = max(1, (geometry.size.width - totalGap) / CGFloat(max(days.count, 1)))
-            let chartHeight = max(geometry.size.height - 8, 12)
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 6) {
+                Label("每日 Token 消耗", systemImage: "chart.bar.xaxis")
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
 
-            ZStack(alignment: .bottom) {
-                // 中位 50% 极淡参考线 + 底部参考基线，呼应整体图表视觉语法
-                VStack(spacing: 0) {
-                    Spacer()
-                    Rectangle()
-                        .fill(Color.primary.opacity(0.05))
-                        .frame(height: 0.5)
-                    Spacer()
-                    Rectangle()
-                        .fill(Color.primary.opacity(0.08))
-                        .frame(height: 0.5)
+                Spacer(minLength: 3)
+
+                HStack(spacing: 5) {
+                    Text("区间合计")
+                        .foregroundStyle(.secondary)
+                    Text(data.totalTokens.tokenText)
+                        .fontWeight(.semibold)
+                    if let cost = data.estimatedCost {
+                        Text("·")
+                            .foregroundStyle(.tertiary)
+                        Text(cost.estimatedCostText)
+                            .foregroundStyle(.secondary)
+                    }
                 }
-                .padding(.top, 8)
+                .font(.system(size: 10, design: .rounded))
+                .monospacedDigit()
+                .lineLimit(1)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(Color.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 5))
+                .help(data.hasUnpricedUsage ? "部分用量缺少费用估算，合计包含已知费用" : "所选区间的 Token 和预估费用")
+            }
 
-                HStack(alignment: .bottom, spacing: gap) {
-                    ForEach(days) { day in
-                        let ratio = Double(day.tokens.total) / maximum
-                        let isHovered = hoveredDay?.id == day.id
-                        let isSelected = selectedDateKey == day.dateKey
-                        let barHeight = day.tokens.total == 0
-                            ? 3
-                            : max(4, chartHeight * CGFloat(ratio))
+            HStack(spacing: 7) {
+                options(TokenActivityRange.allCases, selection: $range, label: "日期范围")
+                    .help("活跃 14 日从最近 30 天有用量的日期中选择")
 
-                        VStack(spacing: 3) {
-                            Spacer(minLength: 0)
+                options(TokenActivityGrouping.allCases, selection: $grouping, label: "用量分组")
+                    .frame(width: 94)
+            }
 
-                            // 悬停或选中时在柱顶显示精巧高光圆点
-                            Circle()
-                                .fill(isSelected ? Color.cyan : Color.indigo)
-                                .frame(width: 3.5, height: 3.5)
-                                .opacity(isHovered || isSelected ? 1 : 0)
+            if data.totalTokens > 0 {
+                plot
+                    .frame(height: 146)
+            } else {
+                Text("此区间没有 Token 用量")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 104)
+            }
 
-                            RoundedRectangle(cornerRadius: min(width / 2, 2.5), style: .continuous)
-                                .fill(barFill(for: day, ratio: ratio, isHovered: isHovered, isSelected: isSelected))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: min(width / 2, 2.5), style: .continuous)
-                                        .strokeBorder(
-                                            day.tokens.total > 0
-                                                ? (isSelected ? Color.cyan.opacity(0.65) : Color.indigo.opacity(isHovered ? 0.8 : 0.25))
-                                                : Color.clear,
-                                            lineWidth: 0.5
-                                        )
-                                )
-                                .frame(width: width, height: barHeight)
+            if !data.series.isEmpty {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 108), spacing: 7)], alignment: .leading, spacing: 5) {
+                    ForEach(data.series) { series in
+                        HStack(spacing: 4) {
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(series.color)
+                                .frame(width: 7, height: 7)
+                            Text(series.title)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
                         }
-                        .frame(width: width, height: geometry.size.height)
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .help(series.title)
+                    }
+                }
+            }
+
+            dayReadout
+        }
+        .padding(12)
+        .tokenCard()
+        .onChange(of: range) { _, _ in hoveredDateKey = nil }
+    }
+
+    private func options<Option: Hashable & RawRepresentable>(
+        _ values: [Option], selection: Binding<Option>, label: String
+    ) -> some View where Option.RawValue == String {
+        HStack(spacing: 1) {
+            ForEach(values, id: \.self) { option in
+                let isSelected = selection.wrappedValue == option
+                Button {
+                    selection.wrappedValue = option
+                } label: {
+                    Text(option.rawValue)
+                        .font(.system(size: 9.5, weight: isSelected ? .semibold : .medium))
+                        .foregroundStyle(isSelected ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .frame(maxWidth: .infinity, minHeight: 20)
+                        .background(Color.indigo.opacity(isSelected ? 0.22 : 0), in: RoundedRectangle(cornerRadius: 4))
                         .contentShape(Rectangle())
-                        .onTapGesture {
-                            onSelectDay?(day)
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(isSelected ? .isSelected : [])
+            }
+        }
+        .padding(2)
+        .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(label)
+    }
+
+    private var dayReadout: some View {
+        HStack(spacing: 5) {
+            if isHistoricalSelection, let selectedDay {
+                Button(action: onClearSelection) {
+                    HStack(spacing: 4) {
+                        Text(formatTokenDateKey(selectedDay.dateKey))
+                        Image(systemName: "xmark")
+                            .font(.system(size: 7, weight: .semibold))
+                    }
+                    .foregroundStyle(.cyan)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.cyan.opacity(0.12), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .help("清除单日筛选并返回今日")
+            }
+
+            Spacer(minLength: 0)
+
+            if data.totalTokens > 0 {
+                Text("点击柱条查看当天明细")
+            }
+        }
+        .font(.system(size: 9.5, design: .rounded))
+        .monospacedDigit()
+        .foregroundStyle(.secondary)
+        .frame(minHeight: 14)
+    }
+
+    private var plot: some View {
+        GeometryReader { geometry in
+            let axisWidth: CGFloat = 42
+            let dateLabelWidth: CGFloat = 30
+            let frame = CGRect(
+                x: axisWidth,
+                y: 7,
+                width: max(1, geometry.size.width - axisWidth - dateLabelWidth / 2),
+                height: geometry.size.height - 26
+            )
+            let slot = frame.width / CGFloat(max(1, data.days.count))
+            let dateTicks = dateTickIndices(width: frame.width)
+
+            ZStack(alignment: .topLeading) {
+                Canvas { context, _ in
+                    drawPlot(in: context, frame: frame, slot: slot, dateTicks: dateTicks)
+                }
+                .accessibilityHidden(true)
+                .allowsHitTesting(false)
+
+                ForEach(0...data.tickCount, id: \.self) { tick in
+                    let value = Double(tick) * data.tickStep
+                    let count = value < Double(Int64.max) ? Int64(value) : Int64.max
+                    Text(count.tokenText)
+                        .frame(width: frame.minX - 6, alignment: .trailing)
+                        .position(x: (frame.minX - 6) / 2, y: frame.maxY - frame.height * CGFloat(tick) / CGFloat(data.tickCount))
+                        .accessibilityHidden(true)
+                }
+
+                ForEach(dateTicks, id: \.self) { index in
+                    Text(String(data.days[index].id.suffix(5)))
+                        .frame(width: dateLabelWidth)
+                        .position(x: columnCenter(index, frame: frame, slot: slot), y: frame.maxY + 12)
+                        .accessibilityHidden(true)
+                }
+
+                HStack(spacing: 0) {
+                    ForEach(data.days) { day in
+                        let description = dayDescription(day)
+                        Button {
+                            if NSApp.currentEvent?.type == .leftMouseUp {
+                                hoveredDateKey = day.id
+                            }
+                            onSelectDay(day.usage)
+                        } label: {
+                            Color.clear
+                                .frame(width: slot, height: frame.height)
+                                .contentShape(Rectangle())
                         }
-                        .onHover { hovering in
-                            if hovering {
-                                hoveredDay = day
-                            } else if hoveredDay?.id == day.id {
-                                hoveredDay = nil
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(description)
+                        .accessibilityAddTraits(selectedDay?.id == day.id ? .isSelected : [])
+                        .onHover { isHovered in
+                            if isHovered {
+                                hoveredDateKey = day.id
+                            } else if hoveredDateKey == day.id {
+                                hoveredDateKey = nil
                             }
                         }
                     }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                .frame(width: frame.width, height: frame.height, alignment: .topLeading)
+                .offset(x: frame.minX, y: frame.minY)
+            }
+            .font(.system(size: 8.5, design: .rounded))
+            .monospacedDigit()
+            .foregroundStyle(.secondary)
+            .overlay(alignment: .topLeading) {
+                if let index = data.days.firstIndex(where: { $0.id == hoveredDateKey }) {
+                    let center = columnCenter(index, frame: frame, slot: slot)
+                    let gap = min(slot / 2 + 5, 22)
+                    let width = min(184, max(0, geometry.size.width / 2 - gap))
+                    let x = center < geometry.size.width / 2 ? center + gap : center - gap - width
+
+                    hoverDetails(data.days[index])
+                        .frame(width: width)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .offset(x: x, y: frame.minY)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
             }
         }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("最近 30 天 Token 活动")
     }
 
-    private func barFill(
-        for day: DailyTokenUsage,
-        ratio: Double,
-        isHovered: Bool,
-        isSelected: Bool
-    ) -> LinearGradient {
-        if isSelected {
-            let topOpacity = day.tokens.total == 0 ? 0.45 : 0.88
-            let bottomOpacity = day.tokens.total == 0 ? 0.25 : 0.45
-            return LinearGradient(
-                colors: [Color.cyan.opacity(topOpacity), Color.blue.opacity(bottomOpacity)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
+    private func hoverDetails(_ day: TokenActivityChartData.Day) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text(formatTokenDateKey(day.id))
+                Spacer(minLength: 0)
+                Text("\(day.usage.tokens.total.tokenText) Token")
+            }
+            .font(.system(size: 11, weight: .semibold))
+
+            if let cost = day.usage.estimatedCost {
+                HStack {
+                    Text("预估费用")
+                    Spacer(minLength: 0)
+                    Text(cost.estimatedCostText)
+                }
+                .foregroundStyle(.secondary)
+            }
+
+            if day.usage.tokens.total > 0 {
+                Divider().opacity(0.65)
+
+                ForEach(data.series.indices, id: \.self) { index in
+                    let count = day.amounts[index]
+                    if count > 0 {
+                        let series = data.series[index]
+                        HStack(spacing: 5) {
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(series.color)
+                                .frame(width: 7, height: 7)
+                            Text(series.title)
+                                .lineLimit(2)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 0)
+                            Text(count.tokenText)
+                                .fontWeight(.medium)
+                                .fixedSize()
+                        }
+                    }
+                }
+            }
         }
-        if day.tokens.total == 0 {
-            let opacity = isHovered ? 0.20 : 0.07
-            return LinearGradient(
-                colors: [Color.primary.opacity(opacity), Color.primary.opacity(opacity)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
+        .font(.system(size: 10))
+        .monospacedDigit()
+        .foregroundStyle(.primary)
+        .padding(8)
+        .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.primary.opacity(0.15), lineWidth: 0.6)
         }
-        if isHovered {
-            return LinearGradient(
-                colors: [Color.indigo.opacity(0.92), Color.indigo.opacity(0.50)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
+        .shadow(color: .black.opacity(0.22), radius: 7, y: 3)
+    }
+
+    private func drawPlot(in context: GraphicsContext, frame: CGRect, slot: CGFloat, dateTicks: [Int]) {
+        let upperLimit = data.tickStep * Double(data.tickCount)
+        let barWidth = min(28, max(1, slot * 0.68))
+
+        for tick in 0...data.tickCount {
+            let y = frame.maxY - frame.height * CGFloat(tick) / CGFloat(data.tickCount)
+            var line = Path()
+            line.move(to: CGPoint(x: frame.minX, y: y))
+            line.addLine(to: CGPoint(x: frame.maxX, y: y))
+            context.stroke(line, with: .color(.primary.opacity(tick == 0 ? 0.20 : 0.085)), lineWidth: 0.5)
         }
-        let topAlpha = 0.28 + ratio * 0.52
-        return LinearGradient(
-            colors: [Color.indigo.opacity(topAlpha), Color.indigo.opacity(topAlpha * 0.38)],
-            startPoint: .top,
-            endPoint: .bottom
-        )
+
+        var tickMarks = Path()
+        for index in dateTicks {
+            let x = columnCenter(index, frame: frame, slot: slot)
+            tickMarks.move(to: CGPoint(x: x, y: frame.maxY))
+            tickMarks.addLine(to: CGPoint(x: x, y: frame.maxY + 3))
+        }
+        context.stroke(tickMarks, with: .color(.primary.opacity(0.24)), lineWidth: 0.5)
+
+        for (index, day) in data.days.enumerated() {
+            let center = columnCenter(index, frame: frame, slot: slot)
+            let cellX = center - slot / 2
+            let barX = center - barWidth / 2
+            let isSelected = selectedDay?.id == day.id
+            let isHovered = hoveredDateKey == day.id
+
+            if isSelected || isHovered {
+                let cell = CGRect(x: cellX, y: frame.minY, width: slot, height: frame.height)
+                context.fill(Path(roundedRect: cell, cornerRadius: 3), with: .color(.indigo.opacity(isSelected ? 0.15 : 0.09)))
+            }
+
+            let totalHeight = frame.height * CGFloat(Double(day.usage.tokens.total) / upperLimit)
+            guard totalHeight > 0 else { continue }
+            let bounds = CGRect(x: barX, y: frame.maxY - totalHeight, width: barWidth, height: totalHeight)
+            let outline = Path(roundedRect: bounds, cornerRadius: min(3, totalHeight / 2, barWidth / 2))
+            var barContext = context
+            barContext.clip(to: outline)
+
+            var bottom = frame.maxY
+            for (series, count) in zip(data.series, day.amounts) where count > 0 {
+                let height = frame.height * CGFloat(Double(count) / upperLimit)
+                let segment = CGRect(x: barX, y: bottom - height, width: barWidth, height: height)
+                barContext.fill(Path(segment), with: .color(series.color.opacity(isHovered || isSelected ? 1 : 0.86)))
+                bottom -= height
+            }
+
+            if isSelected || isHovered {
+                context.stroke(outline, with: .color(.primary.opacity(0.5)), lineWidth: 0.7)
+            }
+        }
+    }
+
+    private func columnCenter(_ index: Int, frame: CGRect, slot: CGFloat) -> CGFloat {
+        frame.minX + (CGFloat(index) + 0.5) * slot
+    }
+
+    private func dateTickIndices(width: CGFloat) -> [Int] {
+        let count = data.days.count
+        let labels = min(count, max(2, Int(width / 42)))
+        guard labels > 1 else { return Array(data.days.indices) }
+        return (0..<labels).map { $0 * (count - 1) / (labels - 1) }
+    }
+
+    private func dayDescription(_ day: TokenActivityChartData.Day) -> String {
+        var details = ["\(formatTokenDateKey(day.id))，\(day.usage.tokens.total.tokenText) Token"]
+        if let cost = day.usage.estimatedCost { details.append("预估 \(cost.estimatedCostText)") }
+        for (series, count) in zip(data.series, day.amounts) where count > 0 {
+            details.append("\(series.title) \(count.tokenText)")
+        }
+        return details.joined(separator: " · ")
     }
 }
 
